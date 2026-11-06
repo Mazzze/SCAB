@@ -1,9 +1,9 @@
 import math
 import numpy as np
 import pytest
-from scadforge import lang
-from scadforge.trace import trace, fmt
-from scadforge.inspector import Explainer, apply_edit, color_literal
+from scab import lang
+from scab.trace import trace, fmt
+from scab.inspector import Explainer, apply_edit, color_literal
 
 CONFIG = '''
 board_w = 60;

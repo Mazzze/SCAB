@@ -1,7 +1,7 @@
 // Multi-file PCB project: shape the board and place parts here, then
 // PCB → Export KiCad board… writes main.kicad_pcb + main-placement.csv.
 include <config.scad>
-include <../../assets/scadforge/pcb.scad>
+include <../../assets/scab/pcb.scad>
 use <modules/parts.scad>
 
 $fn = 32;

@@ -5,7 +5,7 @@ pytest.importorskip('PySide6')
 from PySide6.QtWidgets import QApplication
 from PySide6.QtTest import QTest
 from PySide6.QtCore import Qt
-from scadforge.editor import Editor, Diagnostic
+from scab.editor import Editor, Diagnostic
 
 app = QApplication.instance() or QApplication([])
 
