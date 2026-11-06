@@ -1730,7 +1730,7 @@ class Window(ProjectMixin,QMainWindow):
             'PROBLEMS: syntax errors are shown while typing; OpenSCAD errors and warnings after compiling — red/yellow markers in the gutter, wavy underline, hover for the message, click in Problems or :cn to jump.\n\n'
             'Touchpad: left drag = orbit; Shift+left drag = pan; two-finger scroll/pinch = zoom. Middle/right navigation also supported.\n'
             'Object tool: Dimensions / Move / Rotate. Drag colored axes; release commits SCAD. Ctrl+left drag rolls camera. Panel arrows and cube minus minimize.\n'
-            'Project: open folder, file tabs, F12 module definition, Ctrl+B saves project files and builds entry.\n'
+            'Project: open folder, file tabs, F12 module definition, Ctrl+B saves project files and builds entry. Double-click a variable: type the new value, Enter applies, Shift+Enter previews.\n'
             'Select a visible top-level object in the viewport; select nested expressions in the tree. Ctrl+click tree objects for booleans.\n\n'
             'OpenSCAD is required. Sources remain ordinary .scad. F5 compiles solid meshes; F6 exports the combined STL.\n'
             'Show plane previews before code edits. Drag its blue square; set axis/tilt. Export KiCad DXF exports the true section for Edge.Cuts, in mm.\n'

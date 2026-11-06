@@ -2,7 +2,7 @@
 import json
 import re
 from pathlib import Path
-from PySide6.QtCore import Qt,QTimer
+from PySide6.QtCore import Qt,QTimer,QObject,QEvent
 from PySide6.QtGui import QAction,QTextCursor,QColor,QBrush
 from PySide6.QtWidgets import (QMenu,QTreeWidget,QTreeWidgetItem,QTabWidget,QFileDialog,QInputDialog,
     QMessageBox,QComboBox,QDialog,QVBoxLayout,QHBoxLayout,QLineEdit,QLabel,QDialogButtonBox,QPushButton)
@@ -328,12 +328,24 @@ class ProjectMixin:
         if not variable:return
         _,a,b=variable;source=self.doc.source
         dialog=QDialog(self);dialog.setWindowTitle('Variable · '+name);layout=QVBoxLayout(dialog)
-        layout.addWidget(QLabel('SCAD expression · Preview does not change the source until Apply'))
+        hint=QLabel('Enter: apply · Shift+Enter: preview in 3D (source unchanged) · Esc: cancel');hint.setObjectName('secondary')
+        layout.addWidget(hint)
         field=QLineEdit(source[a:b].strip());layout.addWidget(field)
-        preview=QPushButton('Preview in 3D');layout.addWidget(preview)
-        preview.clicked.connect(lambda:self.preview_source(source[:a]+' '+field.text()+source[b:]))
+        preview=QPushButton('Preview in 3D  (Shift+Enter)');preview.setAutoDefault(False);layout.addWidget(preview)
+        run_preview=lambda:self.preview_source(source[:a]+' '+field.text()+source[b:])
+        preview.clicked.connect(run_preview)
         controls=QDialogButtonBox(QDialogButtonBox.Apply|QDialogButtonBox.Cancel);layout.addWidget(controls)
+        for button in controls.buttons():button.setAutoDefault(False)
         controls.button(QDialogButtonBox.Apply).clicked.connect(dialog.accept);controls.rejected.connect(dialog.reject)
+        class Keys(QObject):
+            def eventFilter(self,obj,event):
+                if event.type()==QEvent.KeyPress and event.key() in (Qt.Key_Return,Qt.Key_Enter):
+                    if event.modifiers()&Qt.ShiftModifier:run_preview()
+                    else:dialog.accept()
+                    return True
+                return False
+        keys=Keys(dialog);field.installEventFilter(keys)
+        field.selectAll();field.setFocus()
         result=dialog.exec()
         if result:self.replace_source(source[:a]+' '+field.text()+source[b:])
         self.compile()
