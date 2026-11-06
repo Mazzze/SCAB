@@ -22,6 +22,8 @@ geometry authority, your files stay portable.
 ![Silkscreen and a STEP-modelled USB-C connector on the live board](docs/kicad_silkscreen.png)
 ![Two boards from two KiCad projects in one enclosure, placed from the Boards tab](docs/multi_boards.png)
 ![Board-to-board clearance: the display lowered onto the main board](docs/multi_collision.png)
+![The selected board is highlighted with the Move gizmo](docs/select_board.png)
+![Find and replace bar](docs/find_bar.png)
 ![Clearance check: the tall capacitor and the header pins hit the lid](docs/kicad_collision.png)
 
 Measured on a PCB-like test model (board with 200 drilled holes + 600 placed
