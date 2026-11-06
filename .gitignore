@@ -3,7 +3,10 @@ __pycache__/
 .venv/
 .pytest_cache/
 rust-engine/target/
-.scadforge-cache/
-.scadforge-*
+.scab-cache/
+.scab-*
 *.kicad_pcb
 *-placement.csv
+.scadforge-cache/
+.scadforge-*
+!examples/**/*.kicad_pcb

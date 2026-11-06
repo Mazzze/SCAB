@@ -1,4 +1,4 @@
-# SCAD Forge
+# SCAB
 
 A source-first desktop CAD editor for **OpenSCAD**, aimed at designing complex 3D
 PCB assemblies (board shape, mounting holes, parts, enclosures) before taking the
@@ -14,9 +14,10 @@ geometry authority, your files stay portable.
 | **See where the SCAD is wrong** | Syntax errors are flagged while you type. OpenSCAD errors and warnings (including failed `assert`s and the module call chain) are mapped back to the right file and line: gutter dots, wavy underline, hover text with a hint, a clickable **Problems** panel, and `:cn` / `:cp` to jump between them. |
 | **Fast compiles of large models** | The Rust engine expands the design once, splits it into pieces, **instances identical geometry** (vias, screws, repeated parts are meshed once), meshes in parallel and caches by content. Editing one part recompiles one part. |
 | **KiCad export** | `PCB → Export KiCad board…` writes a `.kicad_pcb` with the exact Edge.Cuts outline (true arcs), holes and footprints placed by library id, plus a placement CSV. |
+| **Live KiCad board** | `PCB → Load KiCad board…` shows the real board — outline, pads, holes and the footprints' 3D models — in the same 3D view as your SCAD chassis, and reloads every time you save in KiCad. A generated include gives OpenSCAD the outline, holes and part positions, and the **Clearance** tab flags parts that collide with or come too close to the chassis (e.g. a capacitor that is too tall for the lid). |
 
-![Inspector after clicking an LED](docs/app_inspector.png)
-![Compile error located in the source and the Problems panel](docs/app_errors.png)
+![KiCad board inside an enclosure designed in SCAD](docs/kicad_board.png)
+![Clearance check: the tall capacitor and the header pins hit the lid](docs/kicad_collision.png)
 
 Measured on a PCB-like test model (board with 200 drilled holes + 600 placed
 components, CGAL backend): first compile **242 s → 7.5 s**, recompile after
@@ -41,6 +42,20 @@ the app. If OpenSCAD is not on `PATH`, use *Settings → OpenSCAD path…* or se
 
 Try `examples/parametric_mount.scad` (opened at start-up) and
 `examples/pcb_project/` (multi-file project with the PCB library).
+
+## Working in the window
+
+* One header bar: menus on the left, tools as icons (hover for the name and
+  shortcut). Toggles on the right: draft mesh, build while typing, Vim.
+* Model tools: **Inspect** (I), **Dimension handles** (D), **Move** (G),
+  **Rotate** (R), plus color, duplicate, pattern, boolean, thread, measure and
+  section plane. Right-click the model, the object list or the editor for the
+  same operations on the selected object.
+* Views: Fit (F), Isometric (0), Top (7), Front (1), Right (3), or click the
+  view cube. Left drag orbits, Shift+drag pans, Ctrl+drag rolls, wheel zooms.
+* **Measure**: click two points (on the model or the KiCad board).
+* `File → Save view as PNG`, `File → Open recent`; files changed by another
+  program are reloaded automatically when they have no unsaved edits.
 
 ## The Inspector
 
@@ -109,11 +124,44 @@ mode and pending keys are shown in the status bar.
   `use <>` file, misspelled parameter, missing `;` reported on the next line…).
 * A failed `assert()` or other fatal error keeps the previous mesh visible.
 
+## Live KiCad board and clearance check
+
+Design the enclosure while the board is still changing:
+
+1. `PCB → Load KiCad board…` (or put `// scab: kicad = path/to/board.kicad_pcb`
+   in the SCAD file so the board loads with it). The board appears in the 3D view
+   at its real position: outline and cutouts from Edge.Cuts, drilled holes,
+   pads, and every footprint's 3D model (VRML `.wrl`; for `.step` references a
+   `.wrl` next to it is used; parts without a model show their courtyard box).
+   KiCad paths such as `${KIPRJMOD}` and `${KICAD8_3DMODEL_DIR}` are resolved.
+2. Each time KiCad saves the board, SCAB reloads it, rewrites
+   `kicad/<board>.scad` next to your file and rebuilds.
+3. `include <kicad/board.scad>` gives you, in board coordinates (mm, origin at
+   the KiCad aux/drill origin or the board's lower-left corner, Z = 0 at the
+   bottom of the board):
+   * `kicad_board_outline`, `kicad_board_size`, `kicad_board_thickness`,
+     `kicad_board_holes`, `kicad_mounting_holes`, `kicad_board_cutouts`;
+   * `kicad_parts` — reference, value, footprint, position, rotation, side and
+     the 3D bounding box of every part; `kicad_part("J1")` looks one up;
+   * `kicad_part_box("J1", margin, extend)` — a box for connector cutouts;
+   * `kicad_pcb()` — the board (and parts) as geometry.
+4. The **Clearance** tab lists every part with its height above the board, the
+   headroom above it (below it for bottom-side parts), the smallest gap to the
+   model, and whether it collides. Collisions are red and tight parts amber —
+   in the list and on the 3D board. Set the minimum clearance at the top.
+
+`examples/kicad_chassis/` is a complete example: a KiCad 7 project with its own
+3D models (`board/`) and `chassis.scad`, an enclosure whose walls follow the
+board outline, with standoffs on the mounting holes, a USB-C cutout taken from
+the connector's 3D box and a lid with holes over the button and LEDs. Lower
+`lid_inner` to 7 and the 7.7 mm capacitor turns red. `tools/make_example_board.py`
+regenerates the board.
+
 ## PCB → KiCad workflow
 
 1. `PCB → Insert PCB library + example board` copies
-   [`assets/scadforge/pcb.scad`](assets/scadforge/pcb.scad) into your project
-   (`lib/scadforge/pcb.scad`) and adds an example.
+   [`assets/scab/pcb.scad`](assets/scab/pcb.scad) into your project
+   (`lib/scab/pcb.scad`) and adds an example.
 2. Design with ordinary OpenSCAD, using:
    * `pcb_board(size, thickness, radius, outline) { cutters }`
    * `pcb_hole(pos, d)`, `pcb_mounting_hole(ref, pos, d, footprint)`
@@ -141,17 +189,17 @@ KiCad Edge.Cuts.
   transforms are distributed; `difference`, `hull`, extrusions … stay intact,
   so the result is still exact OpenSCAD geometry), keys pieces by their code
   without the placement, and meshes unique pieces in parallel
-  (`SCADFORGE_WORKERS`, default: CPU count). Results are cached in
-  `.scadforge-cache/` by content (including bytes of imported files).
+  (`SCAB_WORKERS`, default: CPU count). Results are cached in
+  `.scab-cache/` by content (including bytes of imported files).
 * Meshes are loaded with NumPy and instanced on the GPU side; nothing heavy runs
   on the UI thread.
 * Projects compile in place; when unsaved buffers differ from disk, the tree is
   mirrored with hard links and only edited files are written.
 * *Draft mesh* caps `$fn` at 24 for preview only.
 
-Environment knobs: `OPENSCAD_BINARY`, `SCADFORGE_ENGINE`, `SCADFORGE_USE_RUST=0`,
-`SCADFORGE_WORKERS`, `SCADFORGE_MAX_TASKS`, `SCADFORGE_TIMEOUT_SECONDS`,
-`SCADFORGE_MAX_MESH_MB`, `SCADFORGE_CACHE_DIR`, `SCADFORGE_STRICT=1`.
+Environment knobs: `OPENSCAD_BINARY`, `SCAB_ENGINE`, `SCAB_USE_RUST=0`,
+`SCAB_WORKERS`, `SCAB_MAX_TASKS`, `SCAB_TIMEOUT_SECONDS`,
+`SCAB_MAX_MESH_MB`, `SCAB_CACHE_DIR`, `SCAB_STRICT=1`.
 
 ## Development
 
@@ -165,16 +213,20 @@ Layout:
 
 | Path | |
 |---|---|
-| `scadforge/vim.py` | Qt-independent Vim engine (fully unit tested) |
-| `scadforge/editor.py` | Qt editor: Vim adapter, highlighting, completion, diagnostics |
-| `scadforge/lang.py` | OpenSCAD parser with exact source spans |
-| `scadforge/trace.py` | Evaluator / tracer: primitives, world transforms, call chains |
-| `scadforge/inspector.py`, `inspector_panel.py` | Value provenance and the Inspector UI |
-| `scadforge/diagnostics.py`, `problems.py` | Error parsing / mapping and the Problems panel |
-| `scadforge/kicad.py` | `.kicad_pcb` / CSV export |
-| `scadforge/native_engine.py`, `meshio.py` | Rust engine bridge, NumPy STL loading and instancing |
+| `scab/vim.py` | Qt-independent Vim engine (fully unit tested) |
+| `scab/editor.py` | Qt editor: Vim adapter, highlighting, completion, diagnostics |
+| `scab/lang.py` | OpenSCAD parser with exact source spans |
+| `scab/trace.py` | Evaluator / tracer: primitives, world transforms, call chains |
+| `scab/inspector.py`, `inspector_panel.py` | Value provenance and the Inspector UI |
+| `scab/diagnostics.py`, `problems.py` | Error parsing / mapping and the Problems panel |
+| `scab/kicad.py` | `.kicad_pcb` / CSV export |
+| `scab/kicad_import.py`, `vrml.py` | KiCad board + 3D model import, generated SCAD include |
+| `scab/clearance.py`, `clearance_panel.py` | Part-versus-chassis collision / headroom / gap check |
+| `scab/icons.py` | Line icon set (drawn SVG) |
+| `tools/make_example_board.py` | Generates the example KiCad project |
+| `scab/native_engine.py`, `meshio.py` | Rust engine bridge, NumPy STL loading and instancing |
 | `rust-engine/` | Parallel, content-addressed OpenSCAD scheduler |
-| `assets/scadforge/pcb.scad` | PCB helper library |
+| `assets/scab/pcb.scad` | PCB helper library |
 | `assets/BOSL2/` | Bundled [BOSL2](https://github.com/BelfrySCAD/BOSL2) (BSD-2) for the thread tool |
 
 Third-party: BOSL2 © Revar Desmera and contributors, BSD 2-Clause (see

@@ -1,4 +1,4 @@
-//! SCAD Forge native compilation scheduler. JSON-lines protocol on stdout.
+//! SCAB native compilation scheduler. JSON-lines protocol on stdout.
 //!
 //! Pipeline per animation frame:
 //!   1. ONE OpenSCAD run expands the whole design to evaluated CSG. Each
@@ -31,7 +31,7 @@ use tempfile::Builder;
 type Result<T> = std::result::Result<T, String>;
 type Color = [f64; 4];
 type Matrix = [f64; 16];
-const DEFAULT: Color = [0.38, 0.75, 0.73, 1.];
+const DEFAULT: Color = [0.72, 0.74, 0.78, 1.];
 const IDENTITY: Matrix = [1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.];
 pub const MARK: u64 = 9876500;
 
@@ -353,7 +353,7 @@ fn marker(head: &str) -> Option<usize> {
 
 // ----------------------------------------------------------------- execution
 fn run(exe: &str, dir: &Path, source: &str, output: &Path, backend: bool, binary: bool) -> Result<String> {
-    let input = Builder::new().prefix(".scadforge-").suffix(".scad").tempfile_in(dir).map_err(err)?.into_temp_path();
+    let input = Builder::new().prefix(".scab-").suffix(".scad").tempfile_in(dir).map_err(err)?.into_temp_path();
     fs::write(&input, source).map_err(err)?;
     let mut c = command(exe);
     c.current_dir(dir).arg("-o").arg(output);
@@ -363,12 +363,12 @@ fn run(exe: &str, dir: &Path, source: &str, output: &Path, backend: bool, binary
     if binary {
         c.args(["--export-format", "binstl"]);
     }
-    let log_file = Builder::new().prefix(".scadforge-log-").tempfile().map_err(err)?;
+    let log_file = Builder::new().prefix(".scab-log-").tempfile().map_err(err)?;
     let log_handle = log_file.reopen().map_err(err)?;
     c.stdout(log_handle.try_clone().map_err(err)?).stderr(log_handle);
     let mut child = c.arg(&input).spawn().map_err(err)?;
     let start = Instant::now();
-    let limit = std::env::var("SCADFORGE_TIMEOUT_SECONDS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(300).clamp(5, 3600);
+    let limit = std::env::var("SCAB_TIMEOUT_SECONDS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(300).clamp(5, 3600);
     let status = loop {
         if let Some(status) = child.try_wait().map_err(err)? {
             break status;
@@ -389,7 +389,7 @@ fn run(exe: &str, dir: &Path, source: &str, output: &Path, backend: bool, binary
 
 fn digest(code: &str, signature: &str, dir: &Path) -> Result<String> {
     let mut h = Sha256::new();
-    h.update(b"forge-engine-v2\0");
+    h.update(b"scab-engine-v2\0");
     h.update(signature);
     h.update(code);
     // Imported meshes/surfaces are not expanded into CSG. Their bytes must be
@@ -617,7 +617,7 @@ fn compile(request: Request) -> Result<()> {
 
 fn main() {
     if std::env::args().any(|a| a == "--version") {
-        println!("scadforge-engine 0.8.0");
+        println!("scab-engine 0.8.0");
         return;
     }
     let mut input = String::new();

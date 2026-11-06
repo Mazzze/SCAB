@@ -1,5 +1,5 @@
 import pytest
-from scadforge.vim import Vim, TextBuffer, Host, parse_keys, vim_regex
+from scab.vim import Vim, TextBuffer, Host, parse_keys, vim_regex
 
 
 class ClipHost(Host):

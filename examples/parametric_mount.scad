@@ -1,4 +1,4 @@
-// SCAD Forge example — click any part of the model: the Inspector shows the
+// SCAB example — click any part of the model: the Inspector shows the
 // module calls, colours and variables behind it and lets you edit them.
 // Try: click a standoff and change its height; click the LED and pick a colour.
 

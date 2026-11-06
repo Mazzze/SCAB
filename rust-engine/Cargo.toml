@@ -1,12 +1,12 @@
 [package]
-name = "scadforge-engine"
+name = "scab-engine"
 version = "0.8.0"
 edition = "2021"
-description = "Parallel, content-addressed OpenSCAD mesh scheduler for SCAD Forge"
+description = "Parallel, content-addressed OpenSCAD mesh scheduler for SCAB"
 license = "MIT"
 
 [[bin]]
-name = "scadforge-engine"
+name = "scab-engine"
 path = "src/main.rs"
 
 [dependencies]

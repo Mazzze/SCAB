@@ -1,9 +1,9 @@
 from pathlib import Path
 import pytest
-from scadforge.trace import trace
-from scadforge.kicad import from_trace, write_kicad_pcb, write_placement_csv, outline_from_svg, balanced
+from scab.trace import trace
+from scab.kicad import from_trace, write_kicad_pcb, write_placement_csv, outline_from_svg, balanced
 
-LIB = Path(__file__).resolve().parent.parent / 'assets' / 'scadforge' / 'pcb.scad'
+LIB = Path(__file__).resolve().parent.parent / 'assets' / 'scab' / 'pcb.scad'
 
 DESIGN = f'''include <{LIB}>
 module sensor_row(n = 3) {{
