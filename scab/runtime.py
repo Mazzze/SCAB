@@ -7,8 +7,13 @@ import sys
 
 def expected_versions():
     source=Path(__file__).resolve().parent.parent/'requirements.txt'
-    return dict(line.strip().split('==',1) for line in source.read_text().splitlines()
-                if line.strip() and not line.lstrip().startswith('#'))
+    out={}
+    for line in source.read_text().splitlines():
+        line=line.strip()
+        if not line or line.startswith('#') or line.endswith('# optional'):continue
+        name,version=line.split('#',1)[0].strip().split('==',1)
+        out[name]=version
+    return out
 
 
 def python_issue():

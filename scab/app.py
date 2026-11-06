@@ -16,6 +16,7 @@ from .editor import Editor, Diagnostic
 from .diagnostics import parse_log, source_problems, PathMapper, count_text
 from .problems import ProblemsPanel
 from .clearance_panel import ClearancePanel
+from .boards import BoardsPanel, BoardEntry, read_pose, write_pose, add_link, remove_link, pose_from_matrix
 from .inspector_panel import InspectorPanel
 from .inspector import Explainer, apply_edit
 from .trace import trace as trace_design
@@ -144,7 +145,9 @@ def form_dialog(parent, title, fields):
 
 class Window(ProjectMixin,QMainWindow):
     traceReady=Signal(object,object)
-    boardLoaded=Signal(object,object)
+    partsExported=Signal(object,object)
+    exportProgress=Signal(str)
+    boardLoaded=Signal(str,object,object)
 
     def __init__(self, path=None):
         super().__init__()
@@ -193,16 +196,29 @@ class Window(ProjectMixin,QMainWindow):
         self.clearance_panel = ClearancePanel()
         self.clearance_panel.checkRequested.connect(self.run_clearance)
         self.clearance_panel.partSelected.connect(self.select_board_part)
-        self.board_model = None
-        self.board_path = None
-        self.board_loading = False
+        self.boards = {}
+        self.selected_board = None
+        self.boards_panel = BoardsPanel()
+        self.boards_panel.addRequested.connect(self.load_kicad)
+        self.boards_panel.removeRequested.connect(self.remove_board)
+        self.boards_panel.reloadRequested.connect(lambda ident: self.reload_board(ident))
+        self.boards_panel.flipRequested.connect(self.flip_board)
+        self.boards_panel.resetRequested.connect(lambda ident: self.set_board_pose(ident,[0.,0.,0.],[0.,0.,0.]))
+        self.boards_panel.focusRequested.connect(self.focus_board)
+        self.boards_panel.poseEdited.connect(self.set_board_pose)
+        self.boards_panel.visibilityChanged.connect(self.board_visibility)
+        self.boards_panel.boardSelected.connect(self.select_board)
         self.board_watcher = QFileSystemWatcher(self)
         self.board_watcher.fileChanged.connect(self.board_file_changed)
         self.board_timer = QTimer(self); self.board_timer.setSingleShot(True); self.board_timer.timeout.connect(self.reload_kicad)
         self.source_watcher = QFileSystemWatcher(self)
         self.source_watcher.fileChanged.connect(self.source_file_changed)
         self.boardLoaded.connect(self.board_loaded, Qt.QueuedConnection)
+        self.partsExported.connect(self.parts_exported, Qt.QueuedConnection)
+        self.exportProgress.connect(self.info, Qt.QueuedConnection)
         self.viewer.measured.connect(lambda text: self.info(text))
+        self.viewer.boardPicked.connect(self.board_picked)
+        self.viewer.boardTransformed.connect(lambda ident,matrix:self.set_board_pose(ident,*pose_from_matrix(matrix)))
         self.problems_panel = ProblemsPanel()
         self.problems_panel.goto.connect(self.goto_problem)
         self.inspector = InspectorPanel()
@@ -263,6 +279,8 @@ class Window(ProjectMixin,QMainWindow):
         A('undo','Undo',lambda:self.editor.undo(),'Ctrl+Z');A('redo','Redo',lambda:self.editor.redo(),'Ctrl+Shift+Z')
         A('build','Build',self.compile,'F5',tip='Compile the model with OpenSCAD');A('stop','Cancel build',self.cancel_jobs,'Shift+F5')
         A('export','Export STL…',self.export_stl,'F6')
+        A('export_parts','Export chassis parts (one STL per object)…',self.export_parts,'Shift+F6',
+          tip='Every top-level object to its own STL; the KiCad board and %/* objects are left out')
         A('draft','Draft mesh',checkable=True,tip='Cap $fn at 24 for the preview only').toggled.connect(self.draft_mesh.setChecked)
         self.actions['draft'].setChecked(self.draft_mesh.isChecked())
         A('auto','Build while typing',checkable=True).toggled.connect(self.auto.setChecked);self.actions['auto'].setChecked(True)
@@ -283,7 +301,8 @@ class Window(ProjectMixin,QMainWindow):
         A('animate','Animate variable…',self.bind_animation)
         A('measure','Measure',checkable=True,tip='Click two points on the model').toggled.connect(self.set_measure)
         A('section','Section plane',checkable=True).toggled.connect(self.toggle_section)
-        A('kicad_import','Load KiCad board…',self.load_kicad,'Ctrl+Shift+L',tip='Show a .kicad_pcb in 3D; it updates live when KiCad saves')
+        A('kicad_import','Add KiCad board…',self.load_kicad,'Ctrl+Shift+L',tip='Add a .kicad_pcb from any project; it updates live when KiCad saves. Several boards can be added and moved.')
+        A('export_step','Export STEP (model + all boards)…',self.export_step,'Ctrl+Shift+E',tip='One .step with every SCAD object and every visible KiCad board with its 3D parts')
         A('kicad_export','Export KiCad board…',self.export_kicad,'Ctrl+Shift+K')
         A('clearance','Check PCB clearance',self.run_clearance,'Ctrl+Shift+C',tip='Parts of the loaded KiCad board that hit or come close to the model')
         A('kicad','Insert PCB library',self.insert_pcb_template)
@@ -307,17 +326,17 @@ class Window(ProjectMixin,QMainWindow):
                 if name=='-':m.addSeparator()
                 else:m.addAction(self.actions[name])
             return m
-        self.file_menu=menu('File',['new','open','save','-','export','camera','-','settings'])
+        self.file_menu=menu('File',['new','open','save','-','export','export_parts','export_step','camera','-','settings'])
         self.recent_menu=self.file_menu.addMenu('Open recent');self.refresh_recent_menu()
         menu('Edit',['undo','redo','-','vim','auto'])
         menu('View',['fit','view_iso','view_top','view_front','view_right','-','draft','section','-','camera'])
         menu('Model',['inspect','dimensions','move','rotate','-','color','duplicate','pattern','boolean','thread','animate','-','measure','build','stop'])
-        menu('PCB',['kicad_import','reload','clearance','-','kicad','kicad_export'])
+        menu('PCB',['kicad_import','reload','clearance','-','export_parts','export_step','-','kicad','kicad_export'])
         self.project_menu_bar=menus
         self.help_menu=menu('Help',['help'])
         bar=QToolBar();bar.setIconSize(QSize(18,18));bar.setToolButtonStyle(Qt.ToolButtonIconOnly)
         for name in ['new','open','save','|','undo','redo','|','build','stop','export','|','inspect','dimensions','move','rotate','|',
-                     'color','duplicate','pattern','boolean','thread','|','measure','section','|','kicad_import','clearance','kicad_export',
+                     'color','duplicate','pattern','boolean','thread','|','measure','section','|','kicad_import','clearance','export_step','kicad_export',
                      '|','fit','view_iso','view_top','view_front','view_right']:
             if name=='|':bar.addSeparator()
             else:bar.addAction(self.actions[name])
@@ -348,6 +367,7 @@ class Window(ProjectMixin,QMainWindow):
         self.bottom_tabs=QTabWidget();self.bottom_tabs.setDocumentMode(True)
         self.bottom_tabs.addTab(self.inspector,'Inspector')
         self.bottom_tabs.addTab(self.problems_panel,'Problems')
+        self.bottom_tabs.addTab(self.boards_panel,'Boards')
         self.bottom_tabs.addTab(self.clearance_panel,'Clearance')
         self.bottom_tabs.addTab(self.console,'Output')
         rl.addWidget(self.right_split,1)
@@ -446,6 +466,7 @@ class Window(ProjectMixin,QMainWindow):
         self.tree.expandToDepth(1); self.tree.blockSignals(False)
         self.refresh_material_swatches()
         if hasattr(self,'project_timer'):self.project_timer.start(200)
+        if hasattr(self,'boards_panel'):self.sync_boards()
         return True
 
     def refresh_material_swatches(self):
@@ -463,6 +484,7 @@ class Window(ProjectMixin,QMainWindow):
                 color=QColor.fromRgbF(*palette[0]);item.setText(1,color.name());item.setIcon(1,swatch(color))
 
     def tree_selected(self):
+        self.selected_board=None
         items=self.tree.selectedItems()
         self.node=items[0].data(0,Qt.UserRole) if items else None
         if self.node:
@@ -494,6 +516,8 @@ class Window(ProjectMixin,QMainWindow):
             self.viewer.set_handles([]); return
         mode=self.object_tool.currentText() if hasattr(self,'object_tool') else 'Dimensions'
         root=next((r for r in self.doc.roots if self.node and r.start<=self.node.start and self.node.end<=r.end),None)
+        if root is None and getattr(self,'selected_board',None) in getattr(self,'boards',{}) and mode in ('Move','Rotate'):
+            self.viewer.set_handles([]);self.viewer.set_board_gizmo(mode,self.selected_board);return
         self.viewer.set_gizmo(mode,root.start if root else None)
         self.viewer.set_handles(handles_for(self.doc,self.node,self.timeline.value()/1000) if mode=='Dimensions' else [])
 
@@ -722,119 +746,362 @@ class Window(ProjectMixin,QMainWindow):
 
     # ------------------------------------------------------------- KiCad live
     def load_kicad(self):
-        start=str(self.board_path.parent if self.board_path else (self.path.parent if self.path else Path.cwd()))
-        name,_=QFileDialog.getOpenFileName(self,'Load KiCad board',start,'KiCad board (*.kicad_pcb);;KiCad project (*.kicad_pro)')
+        """Add a KiCad board (any project) to this design."""
+        last=next(iter(reversed(self.boards.values())),None)
+        start=str(last.path.parent if last else (self.path.parent if self.path else Path.cwd()))
+        name,_=QFileDialog.getOpenFileName(self,'Add KiCad board',start,'KiCad board (*.kicad_pcb);;KiCad project (*.kicad_pro)')
         if not name:return
-        path=Path(name)
+        path=Path(name).resolve()
         if path.suffix=='.kicad_pro':path=path.with_suffix('.kicad_pcb')
-        self.open_board(path)
-        if self.path and self.editor.toPlainText() and 'scab: kicad' not in self.editor.toPlainText():
-            relative=os.path.relpath(path,self.path.parent).replace(os.sep,'/')
-            include='kicad/'+path.stem+'.scad'
-            answer=QMessageBox.question(self,'Link board',f'Link {path.name} to {self.path.name}?\n\nAdds\n  // scab: kicad = {relative}\n  include <{include}>\n'
-                                        'so the board loads with this file and its outline, holes and part positions are available in OpenSCAD.')
-            if answer==QMessageBox.Yes:
-                self.replace_source(f'// scab: kicad = {relative}\ninclude <{include}>\n'+self.editor.toPlainText())
+        from .kicad_import import board_id,include_names
+        if not self.path:
+            self.info('Save this file first: the board link, pose and include are stored in it');
+            if not self.save():return
+        taken=set(self.boards)
+        ident='kicad' if not taken else board_id(path.parent.name if path.stem=='board' else path.stem,taken)
+        default=ident
+        text,ok=QInputDialog.getText(self,'Board name','Name used in OpenSCAD (letters, digits, _):',text=default)
+        if not ok:return
+        ident=board_id(text,taken) if text.strip() else default
+        relative=os.path.relpath(path,self.path.parent).replace(os.sep,'/')
+        include,_=include_names(ident,path.stem)
+        source=add_link(self.editor.toPlainText(),ident,relative,include)
+        if ident!='kicad' and self.boards:
+            # place the new board next to the others instead of on top of them
+            right=max((self.viewer.board_bounds(i)[1][0] for i in self.boards if self.viewer.board_bounds(i) is not None),default=0.)
+            source=write_pose(source,ident,[round(right+10.,1),0.,0.],[0.,0.,0.])
+        self.replace_source(source)
+        self.sync_boards()
+        self.info(f'Board "{ident}" added · move it in the Boards tab or with Move (G) · include <kicad/{include}>')
 
-    def open_board(self,path):
-        path=Path(path).resolve()
-        if self.board_path and self.board_path!=path and str(self.board_path) in self.board_watcher.files():
-            self.board_watcher.removePath(str(self.board_path))
-        self.board_path=path
-        if str(path) not in self.board_watcher.files():self.board_watcher.addPath(str(path))
-        self.reload_kicad()
+    def open_board(self,path,ident='kicad'):
+        entry=self.boards.get(ident)
+        if entry is None:
+            entry=self.boards[ident]=BoardEntry(ident,Path(path).resolve())
+        entry.path=Path(path).resolve()
+        if str(entry.path) not in self.board_watcher.files():self.board_watcher.addPath(str(entry.path))
+        self.reload_board(ident)
 
     def board_file_changed(self,name):
         # KiCad saves by replacing the file: watch the new inode as well.
         if Path(name).exists() and name not in self.board_watcher.files():self.board_watcher.addPath(name)
-        self.board_timer.start(400)
+        for entry in self.boards.values():
+            if str(entry.path)==name:
+                timer=getattr(entry,'timer',None)
+                if timer is None:
+                    timer=entry.timer=QTimer(self);timer.setSingleShot(True);timer.timeout.connect(lambda i=entry.ident:self.reload_board(i))
+                timer.start(400)
 
     def reload_kicad(self):
-        if not self.board_path:
-            self.info('Load a KiCad board first (PCB → Load KiCad board…)');return
-        if self.board_loading:
-            self.board_timer.start(400);return
-        self.board_loading=True
-        path=self.board_path;executable=self.executable
+        if not self.boards:
+            self.info('Add a KiCad board first (PCB → Add KiCad board…)');return
+        for ident in list(self.boards):self.reload_board(ident)
+
+    def reload_board(self,ident):
+        entry=self.boards.get(ident)
+        if entry is None:return
+        if entry.loading:
+            entry.reload_again=True;return
+        entry.loading=True;entry.error=''
+        path=entry.path;executable=self.executable
         cache=(self.project_root or (self.path.parent if self.path else path.parent))/'.scab-cache'
-        self.clearance_panel.board_label.setText(f'Loading {path.name}…')
+        self.boards_panel.set_boards(list(self.boards.values()))
         def work():
             from .kicad_import import load_board
             try:result,error=load_board(path,executable,cache),None
             except (OSError,ValueError,RuntimeError) as exc:result,error=None,str(exc)
-            self.boardLoaded.emit(result,error)
+            self.boardLoaded.emit(ident,result,error)
         threading.Thread(target=work,daemon=True,name='kicad').start()
 
-    def board_loaded(self,model,error):
-        self.board_loading=False
+    def board_loaded(self,ident,model,error):
+        entry=self.boards.get(ident)
+        if entry is None:return
+        entry.loading=False
+        if getattr(entry,'reload_again',False):
+            entry.reload_again=False;self.reload_board(ident);return
         if model is None:
-            self.clearance_panel.board_label.setText(f'KiCad board failed: {error}');self.error(error or 'KiCad board failed');return
-        first=self.board_model is None
-        self.board_model=model
-        self.viewer.set_reference(model.reference_parts())
+            entry.error=f'failed: {error}';self.boards_panel.set_boards(list(self.boards.values()))
+            self.error(f'KiCad board {ident}: {error}');return
+        first=not any(b.model for b in self.boards.values())
+        entry.model=model
+        self.update_board_view()
         if first:self.viewer.fit()
-        from .kicad_import import write_include
+        from .kicad_import import write_include,include_names
         target=(self.path.parent if self.path else model.board.path.parent)/'kicad'
-        include=target/(model.board.path.stem+'.scad')
+        include=target/include_names(ident,model.board.path.stem)[0]
         before=include.read_text(encoding='utf-8') if include.exists() else None
-        try:write_include(model,target)
+        try:write_include(model,target,ident)
         except (OSError,ValueError) as exc:model.notes.append(f'Include not written: {exc}')
         changed=include.exists() and include.read_text(encoding='utf-8')!=before
-        board=model.board
-        text=f'{board.path.name} · {len(model.parts)} parts · {board.thickness:g} mm · live'
-        self.clearance_panel.board_label.setText(text)
-        self.info(f'KiCad board {"loaded" if first else "updated"}: {board.path.name}'+(' · '+' · '.join(model.notes) if model.notes else ''))
-        if changed and self.compiled_source and 'kicad/' in self.editor.toPlainText():self.compile()
+        self.boards_panel.set_boards(list(self.boards.values()))
+        self.info(f'KiCad board {ident} loaded: {model.board.path.name}'+(' · '+' · '.join(model.notes) if model.notes else ''))
+        if changed and f'kicad/{include.name}' in self.editor.toPlainText():self.compile()
         else:self.run_clearance()
+
+    def update_board_view(self):
+        boards=[]
+        for entry in self.boards.values():
+            if entry.model is None:continue
+            boards.append((entry.ident,entry.model.reference_parts(),entry.matrix,entry.visible,entry.show_parts,entry.model.part_offset))
+        self.viewer.set_boards(boards)
+        if self.selected_board and self.object_tool.currentText() in ('Move','Rotate'):
+            self.viewer.set_board_gizmo(self.object_tool.currentText(),self.selected_board)
+
+    def sync_boards(self):
+        """Match the boards to the `// scab: kicad` links and pose variables in the current file."""
+        from .kicad_import import find_kicad_links
+        source=self.editor.toPlainText()
+        links=dict(find_kicad_links(source,self.path))
+        for ident in [i for i in self.boards if i not in links]:
+            entry=self.boards.pop(ident)
+            if str(entry.path) in self.board_watcher.files() and not any(e.path==entry.path for e in self.boards.values()):
+                self.board_watcher.removePath(str(entry.path))
+        moved=False
+        for ident,path in links.items():
+            pose=read_pose(source,ident) or ([0.,0.,0.],[0.,0.,0.])
+            entry=self.boards.get(ident)
+            if entry is None or entry.path!=path:
+                self.boards[ident]=BoardEntry(ident,path,pose=pose)
+                self.open_board(path,ident)
+            elif [list(entry.pose[0]),list(entry.pose[1])]!=[list(pose[0]),list(pose[1])]:
+                entry.pose=pose;moved=True
+                self.viewer.set_board_pose(ident,entry.matrix)
+        if moved and self.selected_board in self.boards and self.object_tool.currentText() in ('Move','Rotate'):
+            self.viewer.set_board_gizmo(self.object_tool.currentText(),self.selected_board)
+        if links or self.viewer.reference_items:
+            if not links:self.viewer.set_boards([])
+        self.boards_panel.set_boards(list(self.boards.values()))
+        if moved:self.clearance_timer_start()
+
+    def clearance_timer_start(self):
+        if not hasattr(self,'clearance_timer'):
+            self.clearance_timer=QTimer(self);self.clearance_timer.setSingleShot(True);self.clearance_timer.timeout.connect(self.run_clearance)
+        self.clearance_timer.start(250)
+
+    def set_board_pose(self,ident,position,angles):
+        """Write a board pose into the SCAD source (the source is the single source of truth)."""
+        entry=self.boards.get(ident)
+        if entry is None:return
+        position=[round(float(v),4) for v in position];angles=[round(float(v),4) for v in angles]
+        entry.pose=(position,angles)
+        self.viewer.set_board_pose(ident,entry.matrix)
+        source=self.editor.toPlainText()
+        updated=write_pose(source,ident,position,angles)
+        if updated!=source:
+            from PySide6.QtGui import QTextCursor as _Cursor
+            prefix=0
+            while prefix<min(len(source),len(updated)) and source[prefix]==updated[prefix]:prefix+=1
+            suffix=0
+            while suffix<min(len(source),len(updated))-prefix and source[-1-suffix]==updated[-1-suffix]:suffix+=1
+            cursor=_Cursor(self.editor.document());cursor.beginEditBlock()
+            cursor.setPosition(self.editor.buffer.to_qt(prefix));cursor.setPosition(self.editor.buffer.to_qt(len(source)-suffix),_Cursor.KeepAnchor)
+            cursor.insertText(updated[prefix:len(updated)-suffix]);cursor.endEditBlock()
+        self.boards_panel.set_boards(list(self.boards.values()))
+        if self.selected_board==ident and self.object_tool.currentText() in ('Move','Rotate'):
+            self.viewer.set_board_gizmo(self.object_tool.currentText(),ident)
+        self.clearance_timer_start()
+
+    def flip_board(self,ident):
+        entry=self.boards.get(ident)
+        if entry is None:return
+        from .boards import pose_matrix
+        bounds=self.viewer.board_bounds(ident)
+        center=(bounds[0]+bounds[1])/2 if bounds is not None else np.zeros(3)
+        flip=np.eye(4);flip[:3,:3]=np.diag([1.,-1.,-1.]);flip[:3,3]=center-flip[:3,:3]@center
+        self.set_board_pose(ident,*pose_from_matrix(flip@entry.matrix))
+
+    def remove_board(self,ident):
+        if ident not in self.boards:return
+        if QMessageBox.question(self,'Remove board',f'Unlink board "{ident}" from this file? (The KiCad project is not touched.)')!=QMessageBox.Yes:return
+        self.replace_source(remove_link(self.editor.toPlainText(),ident))
+        self.sync_boards();self.update_board_view();self.run_clearance()
+
+    def board_visibility(self,ident,visible,parts):
+        entry=self.boards.get(ident)
+        if entry is None:return
+        entry.visible,entry.show_parts=visible,parts
+        self.update_board_view()
+
+    def select_board(self,ident):
+        self.selected_board=ident
+        mode=self.object_tool.currentText()
+        if ident and mode in ('Move','Rotate'):self.viewer.set_board_gizmo(mode,ident)
+
+    def focus_board(self,ident):
+        bounds=self.viewer.board_bounds(ident)
+        if bounds is None:return
+        low,high=bounds
+        self.viewer.opts['center']=QVector3D(*map(float,(low+high)/2))
+        self.viewer.setCameraPosition(distance=max(10.,float(np.linalg.norm(high-low))*1.8));self.viewer.update()
+
+    def board_picked(self,ident,index,point):
+        entry=self.boards.get(ident)
+        if entry is None or entry.model is None:return
+        self.selected_board=ident;self.boards_panel.select(ident)
+        model=entry.model
+        if index>=model.part_offset:
+            part=model.parts[index-model.part_offset];fp=part.footprint
+            self.info(f'{ident} · {part.ref} · {fp.value} · {fp.lib} · {fp.side}'+('' if part.has_model else ' · no 3D model'))
+        else:
+            self.info(f'Board {ident} · {model.board.path.name} · {len(model.parts)} parts · Move (G) / Rotate (R) to place it')
+        mode=self.object_tool.currentText()
+        if mode in ('Move','Rotate'):self.viewer.set_board_gizmo(mode,ident)
 
     def model_meshes_for_clearance(self):
         source=self.compiled_source or ''
         meshes=[]
         for chunk in self.viewer.scene:
-            if 'kicad_pcb(' in source[chunk[0]:chunk[1]]:continue
+            if 'kicad_pcb(' in source[chunk[0]:chunk[1]] or '_pcb(' in source[chunk[0]:chunk[1]]:continue
             meshes.append((chunk[2],chunk[3]))
         return meshes
 
     def run_clearance(self):
-        model=self.board_model
-        if model is None:return
+        loaded=[e for e in self.boards.values() if e.model is not None and e.visible]
+        if not loaded:
+            self.clearance_panel.set_results([],self.clearance_panel.minimum.value());return
         from .clearance import check
-        parts=[(p.ref,p.vertices,p.has_model,p.footprint.side) for p in model.parts]
-        results=check(parts,self.model_meshes_for_clearance(),model.board.thickness)
+        scad=self.model_meshes_for_clearance()
+        world={e.ident:e.world_parts() for e in loaded}
+        results=[]
+        for entry in loaded:
+            model=entry.model;offset=model.part_offset
+            # headroom is measured away from the board: a flipped board turns its top side down
+            upside_down=(entry.matrix[:3,:3]@np.array([0.,0.,1.]))[2]<0
+            side=lambda p:('bottom' if p.footprint.side=='top' else 'top') if upside_down else p.footprint.side
+            parts=[(p.ref,world[entry.ident][offset+i][0],p.has_model,side(p)) for i,p in enumerate(model.parts)]
+            # other boards (body and parts) are obstacles too: stacked boards must not touch
+            others=[(v,f) for other,items in world.items() if other!=entry.ident for k,(v,f,_) in enumerate(items) if k!=1 and k!=2 and len(f)]
+            for r in check(parts,scad,model.board.thickness,obstacles=others):
+                lo,hi=model.parts[r.index].box     # height above its own board, in board coordinates
+                r.height=float(hi[2]-model.board.thickness) if model.parts[r.index].footprint.side=='top' else float(-lo[2])
+                results.append((entry.ident,r))
         minimum=self.clearance_panel.minimum.value()
         self.clearance_panel.set_results(results,minimum)
         colors={'collision':(0.9,0.2,0.22,1.),'tight':(0.95,0.68,0.2,1.)}
         groups={}
-        for r in results:
+        for ident,r in results:
             status=r.status(minimum)
             if status in colors:
-                faces=len(model.parts[r.index].faces)
-                groups[2+r.index]=[(np.ones(faces,dtype=bool),colors[status])]
+                entry=self.boards[ident];faces=len(entry.model.parts[r.index].faces)
+                groups[(ident,entry.model.part_offset+r.index)]=[(np.ones(faces,dtype=bool),colors[status])]
         self.viewer.highlight_reference(groups)
         counts=self.clearance_panel.summary(minimum)
         index=self.bottom_tabs.indexOf(self.clearance_panel)
         bad=counts['collision']+counts['tight']
         self.bottom_tabs.setTabText(index,'Clearance'+(f' ({bad})' if bad else ''))
         if counts['collision']:
-            self.info(f'Clearance: {counts["collision"]} part(s) collide with the model, {counts["tight"]} tight · see the Clearance tab')
-            self.bottom_tabs.setCurrentWidget(self.clearance_panel)
+            self.info(f'Clearance: {counts["collision"]} part(s) collide, {counts["tight"]} tight · see the Clearance tab')
 
-    def select_board_part(self,index):
-        model=self.board_model
-        if model is None or index is None or index>=len(model.parts):return
-        part=model.parts[index]
-        lo,hi=part.box
+    def select_board_part(self,ident,index):
+        entry=self.boards.get(ident)
+        if entry is None or entry.model is None or index is None or index>=len(entry.model.parts):return
+        part=entry.model.parts[index]
+        v=entry.world_parts()[entry.model.part_offset+index][0]
+        lo,hi=v.min(axis=0),v.max(axis=0)
         self.viewer.show_pick_box(lo,hi)
         self.viewer.opts['center']=QVector3D(*map(float,(lo+hi)/2));self.viewer.update()
         fp=part.footprint
-        self.info(f'{part.ref} · {fp.value} · {fp.lib} · {fp.side} · top at {hi[2]:.2f} mm' + ('' if part.has_model else ' · no 3D model (courtyard box)'))
+        self.info(f'{ident} · {part.ref} · {fp.value} · {fp.lib} · {fp.side} · top at {hi[2]:.2f} mm' + ('' if part.has_model else ' · no 3D model (courtyard box)'))
+
+    def export_parts(self):
+        if not self.parse():return
+        if not self.executable or not Path(self.executable).is_file():
+            self.error('OpenSCAD was not found. Settings → OpenSCAD path…');return
+        from .export_parts import chassis_parts
+        parts=chassis_parts(self.doc)
+        if not parts:
+            self.info('Nothing to export: no top-level objects besides the KiCad board');return
+        start=str((self.path.parent if self.path else Path.cwd())/'stl')
+        folder=QFileDialog.getExistingDirectory(self,'Folder for the chassis STL files',start)
+        if not folder:return
+        prefix=(self.path.stem+'-') if self.path else ''
+        source,directory,snapshot,target=self.render_context()
+        doc=Document(self.editor.toPlainText())
+        executable=self.executable;t=self.timeline.value()/1000
+        names=', '.join(name for _,name in parts)
+        self.info(f'Exporting {len(parts)} part(s): {names} …')
+        def work():
+            from .export_parts import export
+            from .compiler import stage_project
+            cleanup=lambda:None;where=directory
+            try:
+                if snapshot:where,_,cleanup=stage_project(snapshot,threading.Event())
+                results=export(doc,where,executable,folder,prefix,t,
+                               progress=lambda i,n,name:self.exportProgress.emit(f'Exporting {name} ({i+1}/{n}) …'))
+                self.partsExported.emit(results,folder)
+            finally:
+                cleanup()
+        threading.Thread(target=work,daemon=True,name='export-parts').start()
+
+    def parts_exported(self,results,folder):
+        ok=[name for name,path,_ in results if path]
+        empty=[name for name,path,message in results if not path and message=='empty object']
+        failed=[f'{name}: {message}' for name,path,message in results if not path and message!='empty object']
+        lines=[f'Exported to {folder}:']+[f'  {path.name}' for _,path,_ in results if path]
+        if empty:lines+=['Skipped (no geometry): '+', '.join(empty)]
+        if failed:lines+=['Failed:']+['  '+f for f in failed]
+        self.console.setPlainText('\n'.join(lines));self.bottom_tabs.setCurrentWidget(self.console)
+        self.info(f'Exported {len(ok)} chassis part(s) to {folder}'+(f' · {len(empty)} empty skipped' if empty else '')+(f' · {len(failed)} failed' if failed else ''))
+
+    def export_step(self):
+        if self.compiled_source is None and not self.boards:
+            self.info('Build the model first (F5)');return
+        default=(self.path.with_suffix('.step') if self.path else Path('assembly.step'))
+        name,_=QFileDialog.getSaveFileName(self,'Export STEP (model + boards)',str(default),'STEP (*.step *.stp)')
+        if not name:return
+        target=Path(name if name.lower().endswith(('.step','.stp')) else name+'.step')
+        bodies=self.step_bodies()
+        if not bodies:self.info('Nothing to export');return
+        title=self.path.stem if self.path else 'SCAB assembly'
+        self.info(f'Writing {target.name} ({sum(len(b[2]) for b in bodies):,} faces) …')
+        def work():
+            from .stepwrite import write_step
+            try:
+                count=write_step(target,bodies,title)
+                self.exportProgress.emit(f'Exported {target} · {count} solids (SCAD model + {len([e for e in self.boards.values() if e.model and e.visible])} board(s))')
+            except (OSError,ValueError) as error:
+                self.exportProgress.emit(f'STEP export failed: {error}')
+        threading.Thread(target=work,daemon=True,name='step').start()
+
+    def step_bodies(self):
+        """[(name, vertices, faces, rgba)]: SCAD objects split by color, each board body and each part."""
+        bodies=[]
+        source=self.compiled_source or ''
+        from .export_parts import part_name
+        try:roots={n.start:n for n in Document(source).roots}
+        except SourceError:roots={}
+        for index,chunk in enumerate(self.viewer.scene):
+            text=source[chunk[0]:chunk[1]]
+            if '_pcb(' in text:continue
+            node=roots.get(chunk[0])
+            label=part_name(source,node,index) if node is not None else f'scad-{index+1}'
+            render=getattr(chunk,'render',None)
+            if render is not None:
+                vertices,faces,colors=render
+                keys=np.round(colors,3)
+                for color in np.unique(keys,axis=0):
+                    mask=np.all(keys==color,axis=1)
+                    bodies.append((f'{label}-{QColor.fromRgbF(*map(float,color[:3])).name()[1:]}',vertices,faces[mask],tuple(color)))
+            else:
+                bodies.append((label,chunk[2],chunk[3],tuple(getattr(chunk,'color',(.72,.74,.78,1.)))))
+        for entry in self.boards.values():
+            if entry.model is None or not entry.visible:continue
+            world=entry.world_parts();model=entry.model
+            v,f,c=world[0]
+            if len(f)>1:bodies.append((f'{entry.ident}-board',v,f,tuple(c[0])))
+            if entry.show_parts:
+                for i,part in enumerate(model.parts):
+                    v,f,c=world[model.part_offset+i]
+                    # one solid per colour keeps the model colours in CAD tools
+                    keys=np.round(c,3)
+                    for color in np.unique(keys,axis=0):
+                        mask=np.all(keys==color,axis=1)
+                        bodies.append((f'{entry.ident}-{part.ref}',v,f[mask],tuple(color)))
+        return bodies
 
     def check_kicad_link(self):
-        from .kicad_import import find_kicad_link
-        path=find_kicad_link(self.editor.toPlainText(),self.path)
-        if path is not None and path!=self.board_path:self.open_board(path)
+        self.sync_boards()
 
-    # ------------------------------------------------------------ view tools
     def set_view(self,elevation,azimuth):
         self.viewer.set_roll(0.);self.viewer.setCameraPosition(elevation=elevation,azimuth=azimuth)
 
@@ -1101,7 +1368,7 @@ class Window(ProjectMixin,QMainWindow):
         else:
             self.viewer.clear_pick_box()
             QTimer.singleShot(50,self.request_trace)
-        if self.board_model is not None:QTimer.singleShot(0,self.run_clearance)
+        if any(b.model for b in self.boards.values()):QTimer.singleShot(0,self.run_clearance)
         triangles=sum(len(data[3]) for data in frames[0])
         self.info(f'Compiled · {seconds:.2f}s · {triangles:,} triangles · {len(frames)} frame(s) · GPU view ready')
         if self.frames:
@@ -1456,13 +1723,14 @@ class Window(ProjectMixin,QMainWindow):
             'Ex: :w :q :wq :x :e file :s/a/b/g :%s :g/pat/d :v :normal :sort :m :t :d :> :noh :set (ic scs sw ts rnu…) :reg :marks :make :cn :cp (jump between errors) :bn :bp.\n\n'
             'INSPECTOR: click any part of the model. The panel shows the primitive, every module call above it (in any file), its colors, loop values and the variables it uses. '
             'Edit a value and press Enter (mouse wheel / ↑↓ nudge numbers). "definition" edits where the value is written (shared); "only this call" overrides just that call.\n'
-            'KICAD: PCB → Load KiCad board shows the board with its 3D models next to your chassis and reloads it whenever KiCad saves. '
+            'KICAD: PCB → Add KiCad board (several, from any project) shows boards with their 3D models next to your chassis and reloads them whenever KiCad saves. '
+            'Move/rotate boards in the Boards tab or with Move/Rotate; poses are stored as <name>_pose in the file. File → Export STEP writes model + boards. '
             'include <kicad/board.scad> gives the outline, holes and part positions; the Clearance tab lists parts that collide or are too close.\n'
             'TOOLS: header icons or right-click the model / object list / editor. I inspect, D dimensions, G move, R rotate, F fit, 0/7/1/3 views. Measure: click two points.\n'
             'PROBLEMS: syntax errors are shown while typing; OpenSCAD errors and warnings after compiling — red/yellow markers in the gutter, wavy underline, hover for the message, click in Problems or :cn to jump.\n\n'
             'Touchpad: left drag = orbit; Shift+left drag = pan; two-finger scroll/pinch = zoom. Middle/right navigation also supported.\n'
             'Object tool: Dimensions / Move / Rotate. Drag colored axes; release commits SCAD. Ctrl+left drag rolls camera. Panel arrows and cube minus minimize.\n'
-            'Project: open folder, file tabs, F12 module definition, Ctrl+B saves project files and builds entry.\n'
+            'Project: open folder, file tabs, F12 module definition, Ctrl+B saves project files and builds entry. Double-click a variable: type the new value, Enter applies, Shift+Enter previews.\n'
             'Select a visible top-level object in the viewport; select nested expressions in the tree. Ctrl+click tree objects for booleans.\n\n'
             'OpenSCAD is required. Sources remain ordinary .scad. F5 compiles solid meshes; F6 exports the combined STL.\n'
             'Show plane previews before code edits. Drag its blue square; set axis/tilt. Export KiCad DXF exports the true section for Edge.Cuts, in mm.\n'

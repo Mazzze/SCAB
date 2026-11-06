@@ -9,7 +9,9 @@ if not exist .venv\Scripts\python.exe (
 fc /b requirements.txt .venv\requirements.stamp >nul 2>&1
 if errorlevel 1 (
     .venv\Scripts\python.exe -m pip install --upgrade pip
-    .venv\Scripts\python.exe -m pip install -r requirements.txt && copy /y requirements.txt .venv\requirements.stamp >nul
+    findstr /v /c:"# optional" requirements.txt > .venv\required.txt
+    .venv\Scripts\python.exe -m pip install -r .venv\required.txt && copy /y requirements.txt .venv\requirements.stamp >nul
+    .venv\Scripts\python.exe -m pip install cascadio==0.1.1
 )
 where cargo >nul 2>&1
 if not errorlevel 1 (

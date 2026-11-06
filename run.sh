@@ -11,7 +11,10 @@ fi
 STAMP="$VENV/.requirements"
 if [ ! -f "$STAMP" ] || ! cmp -s requirements.txt "$STAMP"; then
     "$VENV/bin/python" -m pip install --upgrade pip >/dev/null
-    "$VENV/bin/python" -m pip install -r requirements.txt
+    grep -v '# optional' requirements.txt > "$VENV/.required.txt"
+    "$VENV/bin/python" -m pip install -r "$VENV/.required.txt"
+    # optional extras (STEP models); the app works without them
+    grep '# optional' requirements.txt | sed 's/#.*//' | xargs -r "$VENV/bin/python" -m pip install || echo "Optional packages skipped"
     cp requirements.txt "$STAMP"
 fi
 ENGINE="rust-engine/target/release/scab-engine"

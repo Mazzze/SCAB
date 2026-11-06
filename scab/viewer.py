@@ -207,6 +207,8 @@ class Viewer(gl.GLViewWidget):
     transformEdited=Signal(str,int,float,object)
     rollChanged=Signal(float)
     contextRequested=Signal(object,object)
+    boardPicked=Signal(str,int,object)
+    boardTransformed=Signal(str,object)
     measured=Signal(str)
     def __init__(self):
         super().__init__()
@@ -227,7 +229,7 @@ class Viewer(gl.GLViewWidget):
         self.gizmo_axis=0;self.gizmo_selected=-1;self.ghosts=[]
         self.pick_items=[]
         self.measure_mode=False;self.measure_points=[]
-        self.reference=[];self.reference_items=[];self.reference_data=[]
+        self.reference=[];self.reference_items=[];self.reference_data=[];self.reference_owner=[];self.board_items={};self.board_local={};self.board_matrix={};self.gizmo_board=None
         self.overlay=Overlay(self); self.overlay.show()
         self.view_cube=ViewCube(self);self.view_cube.show();self.view_cube.reposition()
 
@@ -374,6 +376,7 @@ class Viewer(gl.GLViewWidget):
     def set_gizmo(self,mode,start=None):
         if self.drag_kind in ('translate','rotate'):
             self.drag_kind=None;self.press_pos=None
+        self.gizmo_board=None
         self.transform_mode=mode;self.gizmo_selected=start if start is not None else -1
         data=next((s for s in self.scene if s[0]==start),None)
         if data is not None:
@@ -395,6 +398,9 @@ class Viewer(gl.GLViewWidget):
         else:
             vector=np.zeros(3);vector[axis]=amount;matrix[:3,:3]=rotation(vector)
             matrix[:3,3]=self.gizmo_center-matrix[:3,:3]@self.gizmo_center
+        if getattr(self,'gizmo_board',None):
+            base=getattr(self,'board_matrix',{}).get(self.gizmo_board,np.eye(4))
+            self.set_board_pose(self.gizmo_board,matrix@base,preview=True);return
         qt=QMatrix4x4(*map(float,matrix.flatten()))
         for item,data in zip(self.meshes,self.scene):
             if data[0]==self.gizmo_selected:item.setTransform(qt)
@@ -547,7 +553,15 @@ class Viewer(gl.GLViewWidget):
 
     def mouseReleaseEvent(self,e):
         if self.drag_kind in ('translate','rotate') and self.moved:
-            self.transformEdited.emit(self.drag_kind,self.gizmo_axis,self.drag_value,self.gizmo_center.copy())
+            if getattr(self,'gizmo_board',None):
+                matrix=np.eye(4)
+                if self.drag_kind=='translate':matrix[:3,3]=np.eye(3)[self.gizmo_axis]*self.drag_value
+                else:
+                    vector=np.zeros(3);vector[self.gizmo_axis]=self.drag_value;matrix[:3,:3]=rotation(vector)
+                    matrix[:3,3]=self.gizmo_center-matrix[:3,:3]@self.gizmo_center
+                base=getattr(self,'board_matrix',{}).get(self.gizmo_board,np.eye(4))
+                self.boardTransformed.emit(self.gizmo_board,matrix@base)
+            else:self.transformEdited.emit(self.drag_kind,self.gizmo_axis,self.drag_value,self.gizmo_center.copy())
         elif self.drag_kind=='dimension' and self.moved:
             self.dimensionEdited.emit(self.handles[self.drag_index],self.drag_value)
         elif not self.drag_kind and e.button()==Qt.LeftButton and not self.moved:
@@ -589,6 +603,12 @@ class Viewer(gl.GLViewWidget):
         for start,end,vertices,faces in self.scene:
             dist=ray_hit(vertices,faces,origin,direction,section)
             if dist<best: best,selected=dist,start
+        board=(float('inf'),None)
+        for (vertices,faces,_),owner in zip(self.reference_data,getattr(self,'reference_owner',[])):
+            dist=ray_hit(vertices,faces,origin,direction,section)
+            if dist<board[0]:board=(dist,owner)
+        if board[1] is not None and board[0]<best:
+            self.boardPicked.emit(board[1][0],board[1][1],origin+direction*board[0]);return
         self.picked.emit(selected)
         self.pickedPoint.emit(selected,(origin+direction*best) if np.isfinite(best) else None)
 
@@ -614,7 +634,7 @@ class Viewer(gl.GLViewWidget):
         if include_reference:
             for index,(vertices,faces,_) in enumerate(self.reference_data):
                 d=ray_hit(vertices,faces,origin,direction,section)
-                if d<best[0]:best=(d,'reference',index)
+                if d<best[0]:best=(d,'reference',self.reference_owner[index] if index<len(getattr(self,'reference_owner',[])) else index)
         if not np.isfinite(best[0]):return None
         return best[1],best[2],origin+direction*best[0]
 
@@ -632,27 +652,69 @@ class Viewer(gl.GLViewWidget):
     def set_measure(self,on):
         self.measure_mode=bool(on);self.measure_points=[];self.overlay.update()
 
-    def set_reference(self,parts):
-        """Show non-editable reference geometry, e.g. a KiCad board: [(vertices, faces, face_colors)]."""
+    def set_boards(self,boards):
+        """Reference geometry for KiCad boards.
+
+        boards: [(ident, parts [(vertices, faces, face_colors)] in board coordinates, 4x4 pose, visible, show_parts, part_offset)].
+        Items keep board-local vertices and a GL transform, so moving a board does not re-upload meshes.
+        """
         for item in self.reference_items:self.removeItem(item)
-        self.reference_items=[];self.reference_data=list(parts)
-        for vertices,faces,colors in self.reference_data:
-            shader=shaders.ShaderProgram(f'scab-ref-{id(self)}-{len(self.reference_items)}-{id(vertices)}',
-                [shaders.VertexShader(VERTEX),shaders.FragmentShader(FRAGMENT)],
-                uniforms={'sectionOn':[0.],'nx':[0.],'ny':[0.],'nz':[1.],'position':[0.],'flip':[1.]})
-            item=gl.GLMeshItem(vertexes=vertices,faces=faces,faceColors=colors,smooth=False,drawEdges=False,shader=shader)
-            item.base_face_colors=colors
-            if np.any(colors[:,3]<1):item.setGLOptions('translucent')
-            item.setDepthValue(-5)   # opaque board first, so translucent SCAD parts show it through
-            self.addItem(item);self.reference_items.append(item)
+        self.reference_items=[];self.reference_data=[];self.reference_owner=[];self.board_items={};self.board_local={}
+        for ident,parts,matrix,visible,show_parts,offset in boards:
+            self.board_items[ident]=[];self.board_local[ident]=(parts,offset)
+            if not visible:continue
+            for index,(vertices,faces,colors) in enumerate(parts):
+                if not len(faces) or (index>=offset and not show_parts) or not np.any(colors[:,3]>0):continue
+                shader=shaders.ShaderProgram(f'scab-ref-{id(self)}-{ident}-{index}-{id(vertices)}',
+                    [shaders.VertexShader(VERTEX),shaders.FragmentShader(FRAGMENT)],
+                    uniforms={'sectionOn':[0.],'nx':[0.],'ny':[0.],'nz':[1.],'position':[0.],'flip':[1.]})
+                item=gl.GLMeshItem(vertexes=vertices,faces=faces,faceColors=colors,smooth=False,drawEdges=False,shader=shader)
+                item.base_face_colors=colors;item.owner=(ident,index)
+                if np.any(colors[:,3]<1):item.setGLOptions('translucent')
+                item.setDepthValue(-5)   # opaque boards first, so translucent SCAD parts show them through
+                self.addItem(item);self.reference_items.append(item);self.board_items[ident].append(item)
+            self.set_board_pose(ident,matrix,update=False)
         self.update_section()
 
+    def set_board_pose(self,ident,matrix,update=True,preview=False):
+        """Move a board's items (and the world copies used for picking and measuring)."""
+        qt=QMatrix4x4(*map(float,np.asarray(matrix,dtype=float).flatten()))
+        for item in self.board_items.get(ident,[]):item.setTransform(qt)
+        if not preview:
+            parts,_=self.board_local.get(ident,([],0))
+            keep=[(d,o) for d,o in zip(self.reference_data,self.reference_owner) if o[0]!=ident]
+            self.reference_data=[d for d,_ in keep];self.reference_owner=[o for _,o in keep]
+            for item in self.board_items.get(ident,[]):
+                v,f,c=parts[item.owner[1]]
+                world=(np.c_[v,np.ones(len(v))]@np.asarray(matrix,dtype=float).T)[:,:3].astype(np.float32)
+                self.reference_data.append((world,f,c));self.reference_owner.append(item.owner)
+            self.board_matrix=getattr(self,'board_matrix',{});self.board_matrix[ident]=np.asarray(matrix,dtype=float)
+        if update:self.update()
+
+    def set_reference(self,parts):
+        """Single board, identity pose (kept for simple callers)."""
+        self.set_boards([('kicad',list(parts),np.eye(4),True,True,len(parts))])
+
+    def board_bounds(self,ident):
+        pts=[d[0] for d,o in zip(self.reference_data,self.reference_owner) if o[0]==ident and len(d[0])]
+        if not pts:return None
+        allp=np.vstack(pts);return allp.min(axis=0),allp.max(axis=0)
+
     def highlight_reference(self,groups):
-        """Recolor reference faces: {part_index: [(face_mask, rgba), ...]}."""
-        for index,item in enumerate(self.reference_items):
+        """Recolor reference faces: {(board id, part index): [(face_mask, rgba), ...]}."""
+        for item in self.reference_items:
             colors=item.base_face_colors.copy()
-            for mask,rgba in groups.get(index,[]):colors[mask]=rgba
+            for mask,rgba in groups.get(item.owner,[]):colors[mask]=rgba
             item.opts['meshdata'].setFaceColors(colors);item.meshDataChanged()
+        self.update()
+
+    def set_board_gizmo(self,mode,ident):
+        """Move / rotate gizmo on a board instead of a SCAD object."""
+        bounds=self.board_bounds(ident) if ident else None
+        self.transform_mode=mode;self.gizmo_selected=-1;self.gizmo_board=ident if bounds is not None else None
+        if bounds is not None and mode in ('Move','Rotate'):
+            low,high=bounds;self.gizmo_center=(low+high)/2;self.gizmo_radius=max(5.,float(np.linalg.norm(high-low))*.42)
+        else:self.gizmo_center=None
         self.update()
 
     def show_pick_box(self,low,high,cutter=False):
