@@ -15,6 +15,9 @@ geometry authority, your files stay portable.
 | **Fast compiles of large models** | The Rust engine expands the design once, splits it into pieces, **instances identical geometry** (vias, screws, repeated parts are meshed once), meshes in parallel and caches by content. Editing one part recompiles one part. |
 | **KiCad export** | `PCB → Export KiCad board…` writes a `.kicad_pcb` with the exact Edge.Cuts outline (true arcs), holes and footprints placed by library id, plus a placement CSV. |
 
+![Inspector after clicking an LED](docs/app_inspector.png)
+![Compile error located in the source and the Problems panel](docs/app_errors.png)
+
 Measured on a PCB-like test model (board with 200 drilled holes + 600 placed
 components, CGAL backend): first compile **242 s → 7.5 s**, recompile after
 changing one component **235 s → 0.16 s**.
