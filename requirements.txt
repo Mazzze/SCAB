@@ -1,0 +1,5 @@
+# Tested versions. Newer releases usually work; run.sh / run.bat install exactly these.
+PySide6==6.12.0
+pyqtgraph==0.14.0
+numpy==2.5.3
+PyOpenGL==3.1.10

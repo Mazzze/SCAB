@@ -1,0 +1,22 @@
+[package]
+name = "scadforge-engine"
+version = "0.8.0"
+edition = "2021"
+description = "Parallel, content-addressed OpenSCAD mesh scheduler for SCAD Forge"
+license = "MIT"
+
+[[bin]]
+name = "scadforge-engine"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+regex = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

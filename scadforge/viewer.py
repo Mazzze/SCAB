@@ -187,6 +187,7 @@ class Overlay(QWidget):
 
 class Viewer(gl.GLViewWidget):
     picked=Signal(int)
+    pickedPoint=Signal(int,object)
     dimensionEdited=Signal(object,float)
     dimensionPreview=Signal(str)
     planeMoved=Signal(float)
@@ -210,6 +211,7 @@ class Viewer(gl.GLViewWidget):
         self.handles=[]; self.drag_kind=None; self.drag_index=-1; self.drag_value=0.
         self.roll=0.;self.transform_mode='Dimensions';self.gizmo_center=None;self.gizmo_radius=10.
         self.gizmo_axis=0;self.gizmo_selected=-1;self.ghosts=[]
+        self.pick_items=[]
         self.overlay=Overlay(self); self.overlay.show()
         self.view_cube=ViewCube(self);self.view_cube.show();self.view_cube.reposition()
 
@@ -565,3 +567,21 @@ class Viewer(gl.GLViewWidget):
             dist=ray_hit(vertices,faces,origin,direction,section)
             if dist<best: best,selected=dist,start
         self.picked.emit(selected)
+        self.pickedPoint.emit(selected,(origin+direction*best) if np.isfinite(best) else None)
+
+    def show_pick_box(self,low,high,cutter=False):
+        """Outline the inspected primitive (world-space box)."""
+        self.clear_pick_box()
+        low,high=np.asarray(low,dtype=float),np.asarray(high,dtype=float)
+        pad=max(.05,float(np.max(high-low))*.01)
+        low,high=low-pad,high+pad
+        corners=np.array([[x,y,z] for x in (low[0],high[0]) for y in (low[1],high[1]) for z in (low[2],high[2])])
+        edges=[(i,j) for i in range(8) for j in range(i+1,8) if bin(i^j).count('1')==1]
+        color=(1.,.45,.35,1.) if cutter else (1.,.85,.25,1.)
+        item=gl.GLLinePlotItem(pos=np.array([corners[k] for pair in edges for k in pair],dtype=np.float32),mode='lines',color=color,width=2,antialias=True)
+        item.setGLOptions('additive')
+        self.addItem(item);self.pick_items=[item];self.update()
+
+    def clear_pick_box(self):
+        for item in self.pick_items:self.removeItem(item)
+        self.pick_items=[];self.update()

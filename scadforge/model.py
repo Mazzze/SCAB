@@ -1,4 +1,5 @@
 """Lossless lexical source ranges. OpenSCAD remains the geometry authority."""
+from bisect import bisect_left
 from dataclasses import dataclass, field
 import re
 
@@ -19,18 +20,33 @@ class Node:
     children: list = field(default_factory=list)
 
 class SourceError(ValueError):
-    pass
+    """Lexical/structural error; ``position`` is a character offset or None."""
+    def __init__(self, message, position=None):
+        super().__init__(message)
+        self.position = position
 
 class Document:
     def __init__(self, source):
         self.source = source
         self.tokens = [Token(m[0], m.start(), m.end()) for m in TOKEN.finditer(source)
                        if not m[0].isspace() and not m[0].startswith(('//', '/*'))]
+        self.starts = [t.start for t in self.tokens]
         self.pos = 0
         self.nodes = []
         while self.pos < len(self.tokens):
             self.nodes.append(self.statement())
         self.roots = [n for n in self.nodes if n.kind == 'geometry']
+
+    def here(self, back=0):
+        """Character offset of the current token (or end of source)."""
+        p = self.pos - back
+        if 0 <= p < len(self.tokens):
+            return self.tokens[p].start
+        return self.tokens[-1].end if self.tokens else 0
+
+    def tokens_in(self, a, b):
+        """Tokens whose start lies in [a, b), via bisection."""
+        return self.tokens[bisect_left(self.starts, a):bisect_left(self.starts, b)]
 
     def at(self, offset=0):
         p = self.pos + offset
@@ -38,7 +54,9 @@ class Document:
 
     def balanced(self, opening, closing):
         if self.at() != opening:
-            raise SourceError(f'Expected {opening}')
+            found = self.at() or 'end of file'
+            raise SourceError(f'Expected {opening!r} but found {found!r}', self.here())
+        opened = [self.here()]
         self.pos += 1
         pairs = {'(': ')', '[': ']', '{': '}'}
         stack = [closing]
@@ -50,34 +68,45 @@ class Document:
                 continue
             if v in pairs:
                 stack.append(pairs[v])
+                opened.append(self.here(1))
             elif v in (')', ']', '}'):
                 if v != stack[-1]:
-                    raise SourceError(f'Expected {stack[-1]}, found {v}')
+                    raise SourceError(f'Mismatched {v!r}: expected {stack[-1]!r} to close the bracket opened earlier', self.here(1))
                 stack.pop()
+                opened.pop()
                 if not stack: return
-        raise SourceError(f'Missing {closing}')
+        raise SourceError(f'Unclosed bracket: missing {stack[-1]!r}', opened[-1] if opened else None)
 
     def until_semicolon(self):
+        begin = self.here()
+        previous = None
         while self.pos < len(self.tokens):
             v = self.at()
             if v == ';':
                 self.pos += 1
                 return
+            operand = bool(re.fullmatch(r'[$A-Za-z_][$\w]*|\d.*|".*', v)) and v not in ('let', 'each', 'for', 'if', 'else', 'assert', 'echo', 'function')
+            if operand and previous is not None and previous.value not in ('let', 'each', 'else', 'function') and re.fullmatch(r'[$A-Za-z_][$\w]*|\d.*|".*', previous.value):
+                raise SourceError(f'Missing ";" after {previous.value!r}', previous.end)
+            previous = self.tokens[self.pos]
             if v in ('(', '['):
                 self.balanced(v, ')' if v == '(' else ']')
+                previous = self.tokens[self.pos - 1]
+            elif v in ('}', ')', ']'):
+                raise SourceError(f'Missing ";" before {v!r}', self.here())
             else:
                 self.pos += 1
-        raise SourceError('Missing semicolon')
+        raise SourceError('Missing ";" at end of statement', begin)
 
     def statement(self):
         if not self.at():
-            raise SourceError('Expected statement')
+            raise SourceError('Expected statement', self.here())
         start = self.tokens[self.pos].start
         name = self.at()
         children = []
         kind = 'geometry'
         if name == '}':
-            raise SourceError('Unexpected }')
+            raise SourceError("Unexpected '}' (no matching '{')", start)
         if name in ('include', 'use'):
             self.pos += 1
             self.balanced('<', '>')
@@ -88,7 +117,7 @@ class Document:
             kind = 'definition'
         elif name == 'module':
             self.pos += 1
-            if not self.at(): raise SourceError('Expected module name')
+            if not self.at(): raise SourceError('Expected module name', self.here())
             self.pos += 1
             self.balanced('(', ')')
             children = [self.statement()]
@@ -97,7 +126,7 @@ class Document:
             self.pos += 1
             while self.at() and self.at() != '}':
                 children.append(self.statement())
-            if self.at() != '}': raise SourceError('Missing }')
+            if self.at() != '}': raise SourceError("Unclosed '{': missing '}'", start)
             self.pos += 1
             name = 'group'
         elif name == ';':
@@ -108,11 +137,17 @@ class Document:
                 self.pos += 1
             name = self.at()
             if not re.fullmatch(r'[$A-Za-z_][$\w]*', name):
-                raise SourceError(f'Unexpected token {name!r}')
+                raise SourceError(f'Unexpected {name!r}' if name else 'Unexpected end of file', self.here())
             self.pos += 1
+            if self.at() != '(':
+                found = self.at()
+                hint = ' (missing "=" or ";"?)' if found and re.fullmatch(r'[$A-Za-z_][$\w]*|\d.*', found) else ''
+                raise SourceError(f'Expected "(" after {name!r}{hint}', self.here() if found else self.here(1))
             self.balanced('(', ')')
             if self.at() == ';':
                 self.pos += 1
+            elif not self.at():
+                raise SourceError(f'Missing ";" after {name}(...)', self.tokens[self.pos-1].start)
             else:
                 children.append(self.statement())
             if name == 'if' and self.at() == 'else':
@@ -132,7 +167,7 @@ class Document:
     def variables(self):
         out = []
         for n in self.nodes:
-            ts = [t for t in self.tokens if n.start <= t.start < n.end]
+            ts = self.tokens_in(n.start, n.end)
             if len(ts) >= 3 and ts[1].value == '=':
                 out.append((ts[0].value, ts[1].end, ts[-1].start))
         return out

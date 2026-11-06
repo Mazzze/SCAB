@@ -39,9 +39,12 @@ class ProjectMixin:
         self.project_timer.start(100)
 
     def wire_editor(self,editor):
-        editor.hintChanged.connect(self.hint.setText)
-        editor.modeChanged.connect(self.mode_label.setText)
-        editor.command.connect(self.vim_command)
+        editor.hintChanged.connect(lambda text:self.hint.setText(text or 'Ctrl+Space: completion · F5: compile · Esc: normal mode · :help'))
+        editor.modeChanged.connect(lambda text,e=editor:self.mode_label.setText(text) if e is self.editor else None)
+        editor.message.connect(self.info)
+        editor.ex_handler=self.vim_command
+        editor.definition_handler=self.goto_definition_word
+        editor.toggle_vim(getattr(self,'vim_enabled',True))
         editor.textChanged.connect(lambda e=editor:self.document_changed(e))
 
     def document_changed(self,editor):
@@ -98,10 +101,15 @@ class ProjectMixin:
         except (OSError,UnicodeError) as error:self.error(str(error));return False
         self.switching=True
         # Reuse the blank startup tab only if it is empty; never discard another buffer.
-        editor=Editor();self.wire_editor(editor)
-        self.buffers[editor]=path;index=self.editor_tabs.addTab(editor,path.name)
+        blank=self.editor_tabs.widget(0) if self.editor_tabs.count()==1 else None
+        if blank is not None and self.buffers.get(blank) is None and not blank.document().isModified() and not blank.toPlainText().strip():
+            editor=blank;self.buffers[editor]=path;index=0;self.editor_tabs.setTabText(0,path.name)
+        else:
+            editor=Editor();self.wire_editor(editor)
+            self.buffers[editor]=path;index=self.editor_tabs.addTab(editor,path.name)
         editor.setPlainText(text);editor.document().setModified(False)
         self.switching=False;self.editor_tabs.setCurrentIndex(index);self.activate_document(index)
+        if index==0 and editor is self.editor_tabs.widget(0):self.editor=editor;self.path=path;self.update_title()
         return True
 
     def save_buffer(self,editor):
@@ -264,6 +272,37 @@ class ProjectMixin:
         if path is not None:self.open_document(path)
         if kind=='module':self.editor.select_source(args[0],args[0]+len('module'));self.editor.setFocus()
         elif kind=='variable':self.edit_tree_variable(args[0])
+
+    def goto_definition_word(self,word):
+        """Jump to a module, function or variable definition anywhere in the project / includes."""
+        pattern=re.compile(r'^[ \t]*(?:module|function)[ \t]+'+re.escape(word)+r'\b|^[ \t]*'+re.escape(word)+r'[ \t]*=(?!=)',re.M)
+        seen=set();files=[]
+        for path in self.project_files():
+            files.append(path)
+        def includes(path,text,depth=0):
+            if depth>6:return
+            for m in re.finditer(r'(?:include|use)\s*<([^>]+)>',text):
+                candidate=((path.parent if path else Path.cwd())/m[1]).resolve()
+                if candidate.is_file() and candidate not in seen:
+                    seen.add(candidate);files.append(candidate)
+                    try:includes(candidate,self.source_for(candidate),depth+1)
+                    except (OSError,UnicodeError):pass
+        try:includes(self.path,self.editor.toPlainText())
+        except (OSError,UnicodeError):pass
+        current=self.editor.toPlainText()
+        m=pattern.search(current)
+        if m:
+            self.editor.select_source(m.start()+len(m[0])-len(m[0].lstrip()),m.end());return True
+        for path in files:
+            if path is None or (self.path is not None and Path(path).resolve()==Path(self.path).resolve()):continue
+            try:text=self.source_for(path)
+            except (OSError,UnicodeError):continue
+            m=pattern.search(text)
+            if m:
+                self.open_document(path)
+                self.editor.select_source(m.start()+len(m[0])-len(m[0].lstrip()),m.end());self.editor.setFocus()
+                return True
+        return False
 
     def goto_definition(self):
         cursor=self.editor.textCursor();cursor.select(QTextCursor.WordUnderCursor);name=cursor.selectedText()

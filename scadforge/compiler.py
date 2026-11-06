@@ -7,7 +7,6 @@ import tempfile
 import threading
 import time
 import numpy as np
-import trimesh
 from PySide6.QtCore import QThread, Signal
 from .model import Document,Node
 from .materials import SceneMesh,material_plan,combine_material_meshes,DEFAULT_COLOR
@@ -70,13 +69,61 @@ def run_openscad(source, directory, executable, output, t, cancel, timeout=180):
         if path: Path(path).unlink(missing_ok=True)
 
 
-def load_mesh(path):
-    if not path.exists() or path.stat().st_size == 0: return None
-    mesh = trimesh.load(path, force='mesh', process=False)
-    if len(mesh.faces) == 0: return None
-    # STL has per-face vertices. Merge once, outside interaction/rendering.
-    mesh.merge_vertices()
-    return np.asarray(mesh.vertices, dtype=np.float32), np.asarray(mesh.faces, dtype=np.uint32)
+from .meshio import load_mesh  # noqa: E402  (fast NumPy STL reader)
+
+IGNORED_DIRS = {'__pycache__', '.git', '.scadforge-cache', '.svn', '.hg', 'node_modules'}
+
+
+def stage_project(snapshot, cancelled):
+    """Directory to compile in, given a project snapshot with unsaved buffers.
+
+    Unchanged projects compile in place. Otherwise the tree is mirrored with
+    hard links (symlinks / copies as fallbacks) inside the project's hidden
+    cache, and only the edited files are written. Returns (directory, stage_root
+    or None, cleanup callable).
+    """
+    root = Path(snapshot['root'])
+    changed = {}
+    for relative, text in snapshot['overrides'].items():
+        try:
+            on_disk = (root / relative).read_text(encoding='utf-8-sig')
+        except (OSError, UnicodeError):
+            on_disk = None
+        if on_disk != text:
+            changed[relative] = text
+    entry = root / snapshot['entry']
+    if not changed:
+        return str(entry.parent), None, lambda: None
+    base = root / '.scadforge-cache'
+    base.mkdir(exist_ok=True)
+    stage = Path(tempfile.mkdtemp(prefix='stage-', dir=base))
+    link = getattr(os, 'link', None)
+    for directory, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in IGNORED_DIRS and not d.startswith('.')]
+        if cancelled.is_set():
+            raise Cancelled()
+        relative_dir = Path(directory).relative_to(root)
+        (stage / relative_dir).mkdir(parents=True, exist_ok=True)
+        for name in files:
+            if name.startswith('.'):
+                continue
+            source = Path(directory) / name
+            target = stage / relative_dir / name
+            if str((relative_dir / name).as_posix()) in changed or str(relative_dir / name) in changed:
+                continue
+            try:
+                link(source, target)
+            except (OSError, TypeError, AttributeError):
+                try:
+                    os.symlink(source, target)
+                except OSError:
+                    shutil.copy2(source, target)
+    for relative, text in changed.items():
+        output = stage / relative
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.unlink(missing_ok=True)
+        output.write_text(text, encoding='utf-8')
+    return str((stage / snapshot['entry']).parent), stage, lambda: shutil.rmtree(stage, ignore_errors=True)
 
 
 class CompileJob(QThread):
@@ -92,6 +139,7 @@ class CompileJob(QThread):
         self.times, self.export_path = times, export_path
         self.cancelled = threading.Event()
         self.project_snapshot = project_snapshot
+        self.stage_root = None
         self.draft=bool(draft)
 
     def cancel(self): self.cancelled.set()
@@ -105,17 +153,11 @@ class CompileJob(QThread):
             from .native_engine import find_engine,native_compile
             cache_dir=Path(os.environ.get('SCADFORGE_CACHE_DIR') or (Path(self.project_snapshot['root'])/'.scadforge-cache' if self.project_snapshot else Path(self.directory)/'.scadforge-cache'))
             self.totalProgress.emit(0,'Preparing project')
+            cleanup=lambda:None
             with tempfile.TemporaryDirectory(prefix='scadforge-mesh-') as tmp:
+              try:
                 if self.project_snapshot:
-                    snapshot=self.project_snapshot
-                    stage=Path(tmp)/'project'
-                    def copy_file(source,destination):
-                        if self.cancelled.is_set():raise Cancelled()
-                        return shutil.copy2(source,destination)
-                    shutil.copytree(snapshot['root'],stage,ignore=shutil.ignore_patterns('.*','__pycache__'),copy_function=copy_file)
-                    for relative,text in snapshot['overrides'].items():
-                        output=stage/relative;output.parent.mkdir(parents=True,exist_ok=True);output.write_text(text,encoding='utf-8')
-                    self.directory=str((stage/snapshot['entry']).parent)
+                    self.directory,self.stage_root,cleanup=stage_project(self.project_snapshot,self.cancelled)
                 if not self.export_path and find_engine():
                     frames,logs=native_compile(self,doc,cache_dir)
                     self.ready.emit(self.generation,frames,time.monotonic()-start,logs[-24000:])
@@ -182,6 +224,8 @@ class CompileJob(QThread):
                                 scene.append(chunk)
                             self.totalProgress.emit(int(98*(base+1/total)),'Object ready')
                     frames.append(scene)
+              finally:
+                cleanup()
             self.totalProgress.emit(99,'Uploading GPU meshes')
             self.ready.emit(self.generation, frames, time.monotonic()-start, '\n'.join(logs)[-24000:])
         except Cancelled:

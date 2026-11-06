@@ -1,9 +1,22 @@
+"""Source editor: syntax highlighting, completion, diagnostics and full Vim emulation."""
 import re
-from PySide6.QtCore import Qt, Signal, QStringListModel
-from PySide6.QtGui import (QColor, QFont, QSyntaxHighlighter, QTextCharFormat,
+from PySide6.QtCore import Qt, Signal, QStringListModel, QTimer, QEvent, QRect
+from PySide6.QtGui import (QColor, QFont, QSyntaxHighlighter, QTextCharFormat, QGuiApplication,
                            QTextCursor, QTextFormat, QPainter)
-from PySide6.QtWidgets import QPlainTextEdit, QCompleter, QTextEdit, QWidget
+from PySide6.QtWidgets import QPlainTextEdit, QCompleter, QTextEdit, QWidget, QToolTip
 from .model import SIGNATURES, TOKEN
+from .vim import Vim, Host, Abort
+
+SEVERITY_COLORS = {'error': '#ff5c6c', 'warning': '#f2c14e', 'info': '#6aafff'}
+KEYWORDS = ('module', 'function', 'if', 'else', 'let', 'each', 'true', 'false', 'undef', 'include', 'use',
+            'for', 'intersection_for', 'assert', 'echo', 'children')
+
+QT_KEYS = {Qt.Key_Escape: '<Esc>', Qt.Key_Return: '<CR>', Qt.Key_Enter: '<CR>', Qt.Key_Backspace: '<BS>',
+           Qt.Key_Delete: '<Del>', Qt.Key_Tab: '<Tab>', Qt.Key_Backtab: '<S-Tab>', Qt.Key_Up: '<Up>',
+           Qt.Key_Down: '<Down>', Qt.Key_Left: '<Left>', Qt.Key_Right: '<Right>', Qt.Key_Home: '<Home>',
+           Qt.Key_End: '<End>', Qt.Key_PageUp: '<PageUp>', Qt.Key_PageDown: '<PageDown>', Qt.Key_Insert: '<Insert>'}
+# Ctrl+key combinations the editor keeps for Vim instead of the window's menu shortcuts.
+VIM_CTRL = set('RDUFBEYOIAXVWGNPHJTKLC[]') - {'K', 'L'}
 
 
 class Highlighter(QSyntaxHighlighter):
@@ -11,67 +24,225 @@ class Highlighter(QSyntaxHighlighter):
         def paint(start, length, color, bold=False):
             f = QTextCharFormat()
             f.setForeground(QColor(color))
-            if bold: f.setFontWeight(QFont.Weight.Bold)
+            if bold:
+                f.setFontWeight(QFont.Weight.Bold)
             self.setFormat(start, length, f)
-        state=self.previousBlockState()
-        depth=max(0,state)//2
-        in_comment=bool(max(0,state)%2)
-        palette=('#ffd479','#83d9ff','#d9a0ff','#8fe0b1','#ff9ca8','#c9d8ff')
+        state = self.previousBlockState()
+        depth = max(0, state) // 2
+        in_comment = bool(max(0, state) % 2)
+        palette = ('#ffd479', '#83d9ff', '#d9a0ff', '#8fe0b1', '#ff9ca8', '#c9d8ff')
+        comment_end = 0
         for m in TOKEN.finditer(text):
-            v=m[0];start=m.start();end=m.end()
-            if in_comment:
-                close=text.find('*/',start)
-                if close<0:
-                    paint(start,len(text)-start,'#728296');break
-                paint(start,close+2-start,'#728296')
-                in_comment=False
-                # Token matching resumes below only after this comment's end.
-                self._comment_end=close+2
+            v, start = m[0], m.start()
+            if start < comment_end:
                 continue
-            if start<getattr(self,'_comment_end',0):continue
-            color=None
-            if v.startswith('//'):paint(start,len(v),'#728296');break
+            if in_comment:
+                close = text.find('*/', start)
+                if close < 0:
+                    paint(start, len(text) - start, '#728296')
+                    break
+                paint(start, close + 2 - start, '#728296')
+                in_comment = False
+                comment_end = close + 2
+                continue
+            color = None
+            if v.startswith('//'):
+                paint(start, len(v), '#728296')
+                break
             if v.startswith('/*'):
-                color='#728296'
-                if not v.endswith('*/'):in_comment=True
-            elif v=='/' and text[start:start+2]=='/*':
-                paint(start,len(text)-start,'#728296');in_comment=True;break
-            elif v.startswith('"'):color='#badc98'
+                color = '#728296'
+                if not v.endswith('*/') or len(v) < 4:
+                    in_comment = True
+            elif v == '/' and text[start:start + 2] == '/*':
+                paint(start, len(text) - start, '#728296')
+                in_comment = True
+                break
+            elif v.startswith('"'):
+                color = '#badc98'
             elif v in ('(', '[', '{'):
-                color=palette[depth%len(palette)];depth+=1
+                color = palette[depth % len(palette)]
+                depth += 1
             elif v in (')', ']', '}'):
-                depth=max(0,depth-1);color=palette[depth%len(palette)]
-            elif re.fullmatch(r'\d+(?:\.\d*)?(?:[eE][+-]?\d+)?',v):color='#e4bb81'
-            elif v in SIGNATURES:color='#7cc7f2'
-            elif v in ('module','function','if','else','let','each','true','false','undef','include','use'):color='#ca9ee6'
-            elif v.startswith('$'):color='#e69cba'
-            if color:paint(start,len(v),color)
-        self._comment_end=0
-        self.setCurrentBlockState(depth*2+int(in_comment))
+                depth = max(0, depth - 1)
+                color = palette[depth % len(palette)]
+            elif re.fullmatch(r'\d+(?:\.\d*)?(?:[eE][+-]?\d+)?', v):
+                color = '#e4bb81'
+            elif v in KEYWORDS:
+                color = '#ca9ee6'
+            elif v in SIGNATURES:
+                color = '#7cc7f2'
+            elif v.startswith('$'):
+                color = '#e69cba'
+            if color:
+                paint(start, len(v), color)
+        self.setCurrentBlockState(depth * 2 + int(in_comment))
 
 
 class Gutter(QWidget):
     def __init__(self, editor):
         super().__init__(editor)
         self.editor = editor
+        self.setMouseTracking(True)
+
     def paintEvent(self, event):
         p = QPainter(self)
         p.fillRect(event.rect(), QColor('#151b24'))
-        block = self.editor.firstVisibleBlock()
-        top = self.editor.blockBoundingGeometry(block).translated(self.editor.contentOffset()).top()
+        editor = self.editor
+        block = editor.firstVisibleBlock()
+        top = editor.blockBoundingGeometry(block).translated(editor.contentOffset()).top()
+        current = editor.textCursor().blockNumber()
+        relative = editor.vim_engine.options.get('relativenumber') and editor.vim
+        diagnostics = editor.diagnostics_by_line
         while block.isValid() and top <= event.rect().bottom():
-            h = self.editor.blockBoundingRect(block).height()
-            if block.isVisible() and top+h >= event.rect().top():
-                p.setPen(QColor('#69788c'))
-                p.drawText(0, int(top), self.width()-10, int(h), Qt.AlignRight, str(block.blockNumber()+1))
+            h = editor.blockBoundingRect(block).height()
+            number = block.blockNumber()
+            if block.isVisible() and top + h >= event.rect().top():
+                problems = diagnostics.get(number)
+                if problems:
+                    severity = 'error' if any(d.severity == 'error' for d in problems) else problems[0].severity
+                    p.setBrush(QColor(SEVERITY_COLORS.get(severity, '#ff5c6c')))
+                    p.setPen(Qt.NoPen)
+                    p.drawEllipse(4, int(top + h / 2 - 4), 8, 8)
+                label = str(abs(number - current)) if relative and number != current else str(number + 1)
+                p.setPen(QColor('#d6e2ee' if number == current else '#69788c'))
+                p.drawText(0, int(top), self.width() - 8, int(h), Qt.AlignRight | Qt.AlignVCenter, label)
             block = block.next()
             top += h
+
+    def mouseMoveEvent(self, event):
+        block = self.editor.cursorForPosition(event.position().toPoint()).block()
+        problems = self.editor.diagnostics_by_line.get(block.blockNumber())
+        if problems:
+            QToolTip.showText(event.globalPosition().toPoint(), '\n'.join(d.text() for d in problems), self)
+        else:
+            QToolTip.hideText()
+
+
+class QtBuffer:
+    """Adapts a QTextDocument to the Vim engine's buffer interface (Python str indices)."""
+    def __init__(self, editor):
+        self.editor = editor
+        self._revision = None
+        self._text = ''
+        self._bmp = True
+
+    def text(self):
+        doc = self.editor.document()
+        revision = doc.revision()
+        if revision != self._revision or self._revision is None:
+            self._text = self.editor.toPlainText()
+            self._bmp = len(self._text.encode('utf-16-le')) == 2 * len(self._text)
+            self._revision = revision
+        return self._text
+
+    def to_qt(self, index):
+        text = self.text()
+        if self._bmp:
+            return index
+        return len(text[:index].encode('utf-16-le')) // 2
+
+    def to_py(self, units):
+        text = self.text()
+        if self._bmp:
+            return min(units, len(text))
+        return len(text.encode('utf-16-le')[:units * 2].decode('utf-16-le', errors='ignore'))
+
+    def replace(self, a, b, s, join=False):
+        qa, qb = self.to_qt(a), self.to_qt(b)
+        cursor = QTextCursor(self.editor.document())
+        if join:
+            cursor.joinPreviousEditBlock()
+        else:
+            cursor.beginEditBlock()
+        cursor.setPosition(qa)
+        cursor.setPosition(qb, QTextCursor.KeepAnchor)
+        cursor.insertText(s)
+        cursor.endEditBlock()
+
+    def _history(self, redo):
+        doc = self.editor.document()
+        if not (doc.isRedoAvailable() if redo else doc.isUndoAvailable()):
+            return None
+        cursor = QTextCursor(doc)
+        cursor.setPosition(self.editor.textCursor().position())
+        (doc.redo if redo else doc.undo)(cursor)
+        self._revision = None
+        return self.to_py(cursor.selectionStart() if cursor.hasSelection() else cursor.position())
+
+    def undo(self):
+        return self._history(False)
+
+    def redo(self):
+        return self._history(True)
+
+
+class EditorHost(Host):
+    def __init__(self, editor):
+        self.editor = editor
+
+    def clipboard_get(self):
+        clipboard = QGuiApplication.clipboard()
+        return clipboard.text() if clipboard is not None else None
+
+    def clipboard_set(self, text):
+        clipboard = QGuiApplication.clipboard()
+        if clipboard is not None:
+            clipboard.setText(text)
+
+    def message(self, text, error=False):
+        self.editor.message.emit(('E: ' if error and not text.startswith('E') else '') + text if error else text)
+
+    def ex_command(self, command):
+        handler = self.editor.ex_handler
+        return bool(handler(command)) if handler else False
+
+    def visible_lines(self):
+        editor = self.editor
+        first = editor.firstVisibleBlock().blockNumber()
+        height = max(1, editor.fontMetrics().lineSpacing())
+        return first, first + max(1, editor.viewport().height() // height) - 1
+
+    def scroll(self, kind, amount=0):
+        self.editor.pending_scroll = (kind, amount)
+
+    def goto_definition(self, word):
+        handler = self.editor.definition_handler
+        return bool(handler(word)) if handler else False
+
+    def option_changed(self, name, value):
+        editor = self.editor
+        if name in ('tabstop',):
+            editor.setTabStopDistance(editor.fontMetrics().horizontalAdvance(' ') * value)
+        editor.update_gutter()
+
+    def search_preview(self, start, end):
+        self.editor.preview_range = (start, end) if start >= 0 else None
+        if start >= 0:
+            cursor = self.editor.textCursor()
+            cursor.setPosition(self.editor.buffer.to_qt(start))
+            self.editor.setTextCursor(cursor)
+            self.editor.ensureCursorVisible()
+        self.editor.refresh_decorations()
+
+    def complete(self, forward=True):
+        self.editor.popup(True)
+
+
+class Diagnostic:
+    __slots__ = ('line', 'column', 'severity', 'message', 'file')
+
+    def __init__(self, line, column, severity, message, file=None):
+        self.line, self.column, self.severity, self.message, self.file = line, column, severity, message, file
+
+    def text(self):
+        return f'{self.severity.upper()} line {self.line + 1}: {self.message}'
 
 
 class Editor(QPlainTextEdit):
     modeChanged = Signal(str)
     hintChanged = Signal(str)
     command = Signal(str)
+    message = Signal(str)
 
     def __init__(self):
         super().__init__()
@@ -80,9 +251,16 @@ class Editor(QPlainTextEdit):
         self.setTabStopDistance(self.fontMetrics().horizontalAdvance(' ') * 4)
         self.highlighter = Highlighter(self.document())
         self.vim = True
-        self.mode = 'NORMAL'
-        self.pending, self.count, self.command_buffer, self.register = '', '', '', ''
-        self.find_wait=None; self.last_find=None
+        self.buffer = QtBuffer(self)
+        self.vim_engine = Vim(self.buffer, EditorHost(self))
+        self.ex_handler = None
+        self.definition_handler = None
+        self.pending_scroll = None
+        self.preview_range = None
+        self.syncing = False
+        self.diagnostics = []
+        self.diagnostics_by_line = {}
+        self.all_words = set(SIGNATURES)
         self.completer = QCompleter(self)
         self.word_model = QStringListModel(self.completer)
         self.completer.setModel(self.word_model)
@@ -91,63 +269,71 @@ class Editor(QPlainTextEdit):
         self.completer.setCompletionMode(QCompleter.PopupCompletion)
         self.completer.activated.connect(self.complete)
         self.gutter = Gutter(self)
+        self.words_timer = QTimer(self)
+        self.words_timer.setSingleShot(True)
+        self.words_timer.timeout.connect(self.update_words)
         self.blockCountChanged.connect(self.update_gutter)
         self.updateRequest.connect(lambda *_: self.gutter.update())
+        self.updateRequest.connect(self.update_search_highlight)
         self.cursorPositionChanged.connect(self.cursor_changed)
-        self.textChanged.connect(self.update_words)
+        self.textChanged.connect(lambda: self.words_timer.start(400))
+        self.viewport().installEventFilter(self)
         self.update_gutter()
+        self.update_words()
+        self.apply_cursor_shape()
+
+    # ----------------------------------------------------------- properties
+    @property
+    def mode(self):
+        if not self.vim:
+            return 'EDIT'
+        return self.vim_engine.mode_label
+
+    def set_mode(self, mode):
+        engine = self.vim_engine
+        if mode == 'NORMAL' and engine.mode in ('INSERT', 'REPLACE'):
+            engine.feed('<Esc>')
+        elif mode == 'INSERT' and engine.mode == 'NORMAL':
+            engine.feed('i')
+        self.sync_from_engine()
+
+    def toggle_vim(self, checked):
+        self.vim = checked
+        if checked:
+            self.vim_engine.mode = 'NORMAL'
+            self.vim_engine.keys = []
+        self.apply_cursor_shape()
+        self.refresh_decorations()
+        self.modeChanged.emit(self.mode)
+
+    # ---------------------------------------------------------------- gutter
+    def gutter_width(self):
+        digits = max(3, len(str(self.blockCount())))
+        return 22 + self.fontMetrics().horizontalAdvance('9') * digits
 
     def update_gutter(self, *_):
-        self.setViewportMargins(48, 0, 0, 0)
-        self.gutter.setGeometry(0, 0, 46, self.height())
+        width = self.gutter_width()
+        self.setViewportMargins(width + 2, 0, 0, 0)
+        self.gutter.setGeometry(0, 0, width, self.height())
         self.gutter.update()
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
         self.update_gutter()
 
+    # ------------------------------------------------------------ completion
     def update_words(self):
-        words = set(re.findall(r'[$A-Za-z_][$\w]*', self.toPlainText())) | set(SIGNATURES)
+        words = set(re.findall(r'[$A-Za-z_][$\w]*', self.toPlainText())) | set(SIGNATURES) | set(KEYWORDS)
         self.all_words = words
-        self.word_model.setStringList(sorted(words))
-
-    def set_mode(self, mode):
-        self.mode = mode
-        self.pending = self.count = ''
-        self.modeChanged.emit(mode if self.vim else 'EDIT')
-
-    def toggle_vim(self, checked):
-        self.vim = checked
-        self.set_mode('NORMAL' if checked else 'INSERT')
-
-    def cursor_changed(self):
-        c = self.textCursor()
-        before = self.toPlainText()[:c.position()]
-        # Locate the innermost still-open call, including nested vectors/functions.
-        stack = []
-        for m in TOKEN.finditer(before):
-            if m[0].startswith(('"','//','/*')): continue
-            if m[0] in ('(', '['): stack.append((m[0], m.start()))
-            elif m[0] in (')', ']') and stack: stack.pop()
-        call = next((pos for kind, pos in reversed(stack) if kind == '('), None)
-        if call is not None:
-            m = re.search(r'([$\w]+)\s*$', before[:call])
-        else:
-            m = re.search(r'([$\w]+)\s*$', before)
-        self.hintChanged.emit(SIGNATURES.get(m[1], '') if m else '')
-        line = QTextEdit.ExtraSelection()
-        line.format.setBackground(QColor('#1c2633'))
-        line.format.setProperty(QTextFormat.FullWidthSelection, True)
-        line.cursor = c
-        line.cursor.clearSelection()
-        self.setExtraSelections([line])
-        self.gutter.update()
 
     def complete(self, word):
         c = self.textCursor()
         c.movePosition(QTextCursor.StartOfWord, QTextCursor.KeepAnchor)
         c.insertText(word)
         self.setTextCursor(c)
+        if self.vim:
+            self.vim_engine.refresh()
+            self.vim_engine.pos = self.buffer.to_py(self.textCursor().position())
 
     def popup(self, force=False):
         c = self.textCursor()
@@ -156,10 +342,7 @@ class Editor(QPlainTextEdit):
         if not force and len(word) < 2:
             self.completer.popup().hide()
             return
-        # The current partial token is present in the document, but accepting it
-        # would do nothing. Exclude exact matches, even if used elsewhere.
-        candidates = sorted(w for w in getattr(self, 'all_words', set())
-                            if w.startswith(word) and w != word)
+        candidates = sorted(w for w in self.all_words if w.startswith(word) and w != word)
         self.word_model.setStringList(candidates)
         if not candidates:
             self.completer.popup().hide()
@@ -170,179 +353,399 @@ class Editor(QPlainTextEdit):
         rect.setWidth(310)
         self.completer.complete(rect)
 
+    # ---------------------------------------------------------- source api
     def select_source(self, start, end):
-        c = self.textCursor()
         source = self.toPlainText()
+        c = self.textCursor()
         c.setPosition(len(source[:start].encode('utf-16-le')) // 2)
         c.setPosition(len(source[:end].encode('utf-16-le')) // 2, QTextCursor.KeepAnchor)
         self.setTextCursor(c)
         self.centerCursor()
+        if self.vim:
+            engine = self.vim_engine
+            engine.refresh()
+            engine.pos = engine.clamp(start)
+            if engine.mode != 'NORMAL':
+                engine.mode = 'NORMAL'
+            self.modeChanged.emit(self.mode)
+
+    def goto_line(self, line, column=0):
+        block = self.document().findBlockByNumber(max(0, line))
+        if not block.isValid():
+            return
+        cursor = QTextCursor(block)
+        cursor.setPosition(block.position() + min(max(0, column), max(0, block.length() - 1)))
+        self.setTextCursor(cursor)
+        self.centerCursor()
+        self.vim_engine.refresh()
+        self.vim_engine.pos = self.buffer.to_py(cursor.position())
+        self.setFocus()
 
     def source_position(self):
         units = self.textCursor().position()
-        return len(self.toPlainText().encode('utf-16-le')[:units*2].decode('utf-16-le'))
+        return len(self.toPlainText().encode('utf-16-le')[:units * 2].decode('utf-16-le'))
 
-    def find_character(self,char,direction,till,count,repeat=False):
-        c=self.textCursor();line=c.block().text();position=c.positionInBlock()
-        found=position+(direction if till and repeat else 0)
-        for _ in range(count):
-            found=line.find(char,found+1) if direction>0 else line.rfind(char,0,found)
-            if found<0:self.pending=self.count='';return
-        target=found-direction if till else found
-        base=c.block().position()
-        operator=self.pending if self.pending in ('d','c','y') else ''
-        keep=self.mode=='VISUAL' or bool(operator)
-        if operator and direction>0:target+=1
-        if operator and direction<0:c.setPosition(min(base+len(line),c.position()+1))
-        c.setPosition(base+target,QTextCursor.KeepAnchor if keep else QTextCursor.MoveAnchor)
-        if operator:
-            self.register=c.selectedText().replace('\u2029','\n')
-            if operator!='y':c.removeSelectedText()
-            self.pending=''
-            if operator=='c':self.set_mode('INSERT')
-        self.setTextCursor(c)
-        self.count=''
+    # ------------------------------------------------------------ diagnostics
+    def set_diagnostics(self, diagnostics):
+        self.diagnostics = list(diagnostics)
+        by_line = {}
+        for d in self.diagnostics:
+            by_line.setdefault(d.line, []).append(d)
+        self.diagnostics_by_line = by_line
+        self.refresh_decorations()
+        self.gutter.update()
 
-    def indent_lines(self,outdent=False):
-        cursor=self.textCursor();start,end=cursor.selectionStart(),cursor.selectionEnd()
-        first=self.document().findBlock(start);last=self.document().findBlock(end)
-        if end>start and end==last.position():last=last.previous()
-        first_number,last_number=first.blockNumber(),last.blockNumber()
-        edit=QTextCursor(self.document());edit.beginEditBlock()
-        block=last
-        while block.isValid() and block.blockNumber()>=first_number:
-            edit.setPosition(block.position())
-            if outdent:
-                text=block.text();count=1 if text.startswith('\t') else min(4,len(text)-len(text.lstrip(' ')))
-                edit.setPosition(block.position()+count,QTextCursor.KeepAnchor);edit.removeSelectedText()
-            else:edit.insertText('    ')
-            block=block.previous()
-        edit.endEditBlock()
-        cursor.setPosition(self.document().findBlockByNumber(first_number).position())
-        block=self.document().findBlockByNumber(last_number)
-        cursor.setPosition(block.position()+len(block.text()),QTextCursor.KeepAnchor)
-        self.setTextCursor(cursor);self.completer.popup().hide()
+    def eventFilter(self, obj, event):
+        if obj is self.viewport() and event.type() == QEvent.ToolTip:
+            block = self.cursorForPosition(event.pos()).block()
+            problems = self.diagnostics_by_line.get(block.blockNumber())
+            if problems:
+                QToolTip.showText(event.globalPos(), '\n'.join(d.text() for d in problems), self)
+            else:
+                QToolTip.hideText()
+            return True
+        return super().eventFilter(obj, event)
+
+    # ----------------------------------------------------------- decorations
+    def apply_cursor_shape(self):
+        engine = self.vim_engine
+        block = self.vim and engine.mode not in ('INSERT', 'COMMAND')
+        if self.vim and engine.mode == 'REPLACE':
+            block = False
+        self.setCursorWidth(max(2, self.fontMetrics().horizontalAdvance('M')) if block else 2)
+
+    def refresh_decorations(self):
+        selections = []
+        line = QTextEdit.ExtraSelection()
+        line.format.setBackground(QColor('#1c2633'))
+        line.format.setProperty(QTextFormat.FullWidthSelection, True)
+        line.cursor = QTextCursor(self.textCursor())
+        line.cursor.clearSelection()
+        selections.append(line)
+        for d in self.diagnostics:
+            block = self.document().findBlockByNumber(d.line)
+            if not block.isValid():
+                continue
+            fmt = QTextCharFormat()
+            fmt.setUnderlineStyle(QTextCharFormat.WaveUnderline)
+            fmt.setUnderlineColor(QColor(SEVERITY_COLORS.get(d.severity, '#ff5c6c')))
+            if d.severity == 'error':
+                fmt.setBackground(QColor(110, 24, 36, 90))
+            cursor = QTextCursor(block)
+            text = block.text()
+            start = d.column if d.column is not None and d.column < len(text) else len(text) - len(text.lstrip())
+            cursor.setPosition(block.position() + start)
+            end = block.position() + (len(text) if len(text) > start else start + 1)
+            cursor.setPosition(min(end, self.document().characterCount() - 1), QTextCursor.KeepAnchor)
+            sel = QTextEdit.ExtraSelection()
+            sel.format = fmt
+            sel.cursor = cursor
+            selections.append(sel)
+        selections.extend(self.search_selections())
+        if self.vim:
+            engine = self.vim_engine
+            for a, b in engine.selection():
+                sel = QTextEdit.ExtraSelection()
+                sel.format.setBackground(QColor('#3b5f7d'))
+                cursor = QTextCursor(self.document())
+                cursor.setPosition(self.buffer.to_qt(a))
+                cursor.setPosition(self.buffer.to_qt(b), QTextCursor.KeepAnchor)
+                sel.cursor = cursor
+                selections.append(sel)
+            if self.preview_range:
+                a, b = self.preview_range
+                sel = QTextEdit.ExtraSelection()
+                sel.format.setBackground(QColor('#c79a2a'))
+                sel.format.setForeground(QColor('#101720'))
+                cursor = QTextCursor(self.document())
+                cursor.setPosition(self.buffer.to_qt(a))
+                cursor.setPosition(self.buffer.to_qt(b), QTextCursor.KeepAnchor)
+                sel.cursor = cursor
+                selections.append(sel)
+        selections.extend(self.bracket_selections())
+        self.setExtraSelections(selections)
+
+    def search_selections(self):
+        if not self.vim:
+            return []
+        regex = self.vim_engine.highlight_regex()
+        if regex is None:
+            return []
+        first = self.firstVisibleBlock()
+        if not first.isValid():
+            return []
+        height = max(1, self.fontMetrics().lineSpacing())
+        lines = self.viewport().height() // height + 2
+        last = self.document().findBlockByNumber(first.blockNumber() + lines)
+        start_qt = first.position()
+        end_qt = last.position() + last.length() if last.isValid() else self.document().characterCount() - 1
+        text = self.buffer.text()
+        a, b = self.buffer.to_py(start_qt), self.buffer.to_py(end_qt)
+        out = []
+        for m in regex.finditer(text, a, b):
+            if m.end() == m.start():
+                continue
+            sel = QTextEdit.ExtraSelection()
+            sel.format.setBackground(QColor('#5b4a1c'))
+            cursor = QTextCursor(self.document())
+            cursor.setPosition(self.buffer.to_qt(m.start()))
+            cursor.setPosition(self.buffer.to_qt(m.end()), QTextCursor.KeepAnchor)
+            sel.cursor = cursor
+            out.append(sel)
+            if len(out) > 400:
+                break
+        return out
+
+    def update_search_highlight(self, rect, dy):
+        if dy and self.vim and self.vim_engine.highlight_regex() is not None:
+            QTimer.singleShot(0, self.refresh_decorations)
+
+    def bracket_selections(self):
+        text = self.buffer.text()
+        p = self.buffer.to_py(self.textCursor().position())
+        for q in (p, p - 1):
+            if 0 <= q < len(text) and text[q] in '()[]{}':
+                engine = self.vim_engine
+                engine.refresh()
+                try:
+                    match = engine.match_bracket(q)
+                except (IndexError, KeyError):
+                    match = None
+                if match is None:
+                    return []
+                out = []
+                for position in (q, match):
+                    sel = QTextEdit.ExtraSelection()
+                    sel.format.setBackground(QColor('#2d4f5a'))
+                    sel.format.setForeground(QColor('#ffffff'))
+                    cursor = QTextCursor(self.document())
+                    cursor.setPosition(self.buffer.to_qt(position))
+                    cursor.setPosition(self.buffer.to_qt(position + 1), QTextCursor.KeepAnchor)
+                    sel.cursor = cursor
+                    out.append(sel)
+                return out
+        return []
+
+    # ----------------------------------------------------------------- cursor
+    def cursor_changed(self):
+        c = self.textCursor()
+        text = self.buffer.text()
+        position = self.buffer.to_py(c.position())
+        before = text[max(0, position - 6000):position]
+        stack = []
+        for m in TOKEN.finditer(before):
+            if m[0].startswith(('"', '//', '/*')):
+                continue
+            if m[0] in ('(', '['):
+                stack.append((m[0], m.start()))
+            elif m[0] in (')', ']') and stack:
+                stack.pop()
+        call = next((pos for kind, pos in reversed(stack) if kind == '('), None)
+        m = re.search(r'([$\w]+)\s*$', before[:call] if call is not None else before)
+        self.hintChanged.emit(SIGNATURES.get(m[1], '') if m else '')
+        if not self.syncing and self.vim:
+            engine = self.vim_engine
+            engine.refresh()
+            if engine.mode not in ('COMMAND',):
+                engine.pos = position
+        self.refresh_decorations()
+        self.gutter.update()
+
+    def sync_from_engine(self):
+        engine = self.vim_engine
+        self.syncing = True
+        try:
+            cursor = self.textCursor()
+            target = self.buffer.to_qt(min(engine.pos, len(self.buffer.text())))
+            if cursor.position() != target or cursor.hasSelection():
+                cursor.setPosition(target)
+                self.setTextCursor(cursor)
+            if self.pending_scroll:
+                kind, amount = self.pending_scroll
+                self.pending_scroll = None
+                bar = self.verticalScrollBar()
+                if kind == 'lines':
+                    bar.setValue(bar.value() + amount)
+                elif kind == 'center':
+                    self.centerCursor()
+                elif kind in ('top', 'bottom'):
+                    line = self.textCursor().blockNumber()
+                    first, last = engine.host.visible_lines()
+                    bar.setValue(max(0, line if kind == 'top' else line - (last - first)))
+            self.ensureCursorVisible()
+        finally:
+            self.syncing = False
+        self.apply_cursor_shape()
+        self.refresh_decorations()
+        self.gutter.update()
+        self.modeChanged.emit(self.mode)
+
+    # -------------------------------------------------------------- keyboard
+    @staticmethod
+    def key_name(e):
+        key, text, mods = e.key(), e.text(), e.modifiers()
+        ctrl = bool(mods & (Qt.ControlModifier | Qt.MetaModifier)) if False else bool(mods & Qt.ControlModifier)
+        if key in (Qt.Key_Shift, Qt.Key_Control, Qt.Key_Alt, Qt.Key_Meta, Qt.Key_AltGr, Qt.Key_CapsLock):
+            return None
+        if ctrl:
+            if key == Qt.Key_BracketLeft:
+                return '<Esc>'
+            if key == Qt.Key_BracketRight:
+                return '<C-]>'
+            if key == Qt.Key_Space:
+                return '<C-Space>'
+            if Qt.Key_A <= key <= Qt.Key_Z:
+                return '<C-%s>' % chr(key).lower()
+            return None
+        if key in QT_KEYS:
+            if key == Qt.Key_Backtab or (key == Qt.Key_Tab and mods & Qt.ShiftModifier):
+                return '<S-Tab>'
+            return QT_KEYS[key]
+        if text and text.isprintable():
+            return text
+        return None
+
+    def event(self, e):
+        # Let Vim own Ctrl+letter keys (Ctrl-R redo, Ctrl-O jumps, Ctrl-V block...)
+        if e.type() == QEvent.ShortcutOverride and self.vim:
+            mods = e.modifiers()
+            if mods == Qt.ControlModifier and Qt.Key_A <= e.key() <= Qt.Key_Z and chr(e.key()) in VIM_CTRL:
+                e.accept()
+                return True
+            if e.key() == Qt.Key_Escape:
+                e.accept()
+                return True
+        return super().event(e)
 
     def keyPressEvent(self, e):
-        key, text, mods = e.key(), e.text(), e.modifiers()
-        ctrl = bool(mods & Qt.ControlModifier)
-        if key in (Qt.Key_Tab,Qt.Key_Backtab):
-            cursor=self.textCursor()
-            if cursor.hasSelection() or key==Qt.Key_Backtab or (self.vim and self.mode!='INSERT'):
-                self.indent_lines(key==Qt.Key_Backtab or bool(mods & Qt.ShiftModifier));return
-        if key == Qt.Key_Escape:
-            self.find_wait=None
-            self.completer.popup().hide()
-            c = self.textCursor(); c.clearSelection(); self.setTextCursor(c)
-            self.command_buffer = ''
-            self.set_mode('NORMAL' if self.vim else 'INSERT')
-            return
-        if self.completer.popup().isVisible():
-            if key in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Tab):
-                index = self.completer.popup().currentIndex()
+        key = self.key_name(e)
+        popup = self.completer.popup()
+        if popup.isVisible() and key in ('<CR>', '<Tab>', '<Up>', '<Down>', '<C-n>', '<C-p>'):
+            if key in ('<CR>', '<Tab>'):
+                index = popup.currentIndex()
                 word = index.data() if index.isValid() else self.completer.currentCompletion()
-                if word: self.complete(word)
-                self.completer.popup().hide()
+                if word:
+                    self.complete(word)
+                popup.hide()
                 return
-            if key in (Qt.Key_Up, Qt.Key_Down):
-                index = self.completer.popup().currentIndex()
-                row = max(0, index.row()) + (1 if key == Qt.Key_Down else -1)
-                model = self.completer.completionModel()
-                row = max(0, min(row, model.rowCount()-1))
-                self.completer.popup().setCurrentIndex(model.index(row,0))
+            index = popup.currentIndex()
+            row = max(0, index.row()) + (1 if key in ('<Down>', '<C-n>') else -1)
+            model = self.completer.completionModel()
+            popup.setCurrentIndex(model.index(max(0, min(row, model.rowCount() - 1)), 0))
+            return
+        if key == '<C-Space>':
+            self.popup(True)
+            return
+        if not self.vim:
+            self.conventional_key(e)
+            return
+        if key is None:
+            return
+        if key == '<Esc>':
+            popup.hide()
+        engine = self.vim_engine
+        was_insert = engine.mode in ('INSERT', 'REPLACE')
+        engine.refresh()
+        engine.pos = engine.clamp(self.buffer.to_py(self.textCursor().position()), insert=was_insert) if not self.syncing and engine.mode != 'COMMAND' else engine.pos
+        if engine.mode not in ('INSERT', 'REPLACE', 'COMMAND') and not engine.keys:
+            engine.pos = engine.clamp(engine.pos)
+        try:
+            engine.feed(key)
+        except Abort:
+            pass
+        except Exception as error:  # never lose the editor to an engine bug
+            engine.keys = []
+            engine.mode = 'NORMAL'
+            self.message.emit(f'Vim error: {error}')
+        self.sync_from_engine()
+        if engine.mode in ('INSERT', 'REPLACE') and len(key) == 1 and (key.isalnum() or key in '_$'):
+            self.popup()
+        elif popup.isVisible() and (len(key) != 1 or not (key.isalnum() or key in '_$')):
+            popup.hide()
+
+    def inputMethodEvent(self, e):
+        if self.vim and self.vim_engine.mode not in ('INSERT', 'REPLACE'):
+            for ch in e.commitString():
+                self.vim_engine.feed(ch)
+            self.sync_from_engine()
+            e.accept()
+            return
+        super().inputMethodEvent(e)
+
+    def conventional_key(self, e):
+        key, mods = e.key(), e.modifiers()
+        if key in (Qt.Key_Tab, Qt.Key_Backtab):
+            cursor = self.textCursor()
+            if cursor.hasSelection() or key == Qt.Key_Backtab:
+                self.indent_lines(key == Qt.Key_Backtab or bool(mods & Qt.ShiftModifier))
                 return
-        if ctrl and key == Qt.Key_Space:
-            self.popup(True); return
-        if not self.vim or self.mode == 'INSERT':
-            if key == Qt.Key_Tab:
-                self.insertPlainText('    '); return
-            if key in (Qt.Key_Return, Qt.Key_Enter):
-                line = self.textCursor().block().text()
-                indent = re.match(r'\s*', line)[0]
-                before = line[:self.textCursor().positionInBlock()].rstrip()
-                self.insertPlainText('\n' + indent + ('    ' if before.endswith('{') else ''))
-                return
-            super().keyPressEvent(e)
-            if text and (text.isalnum() or text in '_$'): self.popup()
-            else: self.completer.popup().hide()
+            self.insertPlainText('    ')
             return
-        if self.mode == 'COMMAND':
-            if key in (Qt.Key_Return, Qt.Key_Enter):
-                command = self.command_buffer
-                self.command_buffer = ''
-                self.set_mode('NORMAL')
-                self.command.emit(command)
-            elif key == Qt.Key_Backspace: self.command_buffer = self.command_buffer[:-1]
-            else: self.command_buffer += text
-            self.modeChanged.emit(':' + self.command_buffer if self.mode == 'COMMAND' else self.mode)
+        if key in (Qt.Key_Return, Qt.Key_Enter):
+            line = self.textCursor().block().text()
+            indent = re.match(r'\s*', line)[0]
+            before = line[:self.textCursor().positionInBlock()].rstrip()
+            self.insertPlainText('\n' + indent + ('    ' if before.endswith('{') else ''))
             return
-        if self.find_wait and text:
-            direction,till,count=self.find_wait
-            self.find_wait=None
-            self.last_find=(text,direction,till)
-            self.find_character(text,direction,till,count)
+        super().keyPressEvent(e)
+        text = e.text()
+        if text and (text.isalnum() or text in '_$'):
+            self.popup()
+        else:
+            self.completer.popup().hide()
+
+    def indent_lines(self, outdent=False):
+        cursor = self.textCursor()
+        start, end = cursor.selectionStart(), cursor.selectionEnd()
+        first = self.document().findBlock(start)
+        last = self.document().findBlock(end)
+        if end > start and end == last.position():
+            last = last.previous()
+        first_number, last_number = first.blockNumber(), last.blockNumber()
+        edit = QTextCursor(self.document())
+        edit.beginEditBlock()
+        block = last
+        while block.isValid() and block.blockNumber() >= first_number:
+            edit.setPosition(block.position())
+            if outdent:
+                text = block.text()
+                count = 1 if text.startswith('\t') else min(4, len(text) - len(text.lstrip(' ')))
+                edit.setPosition(block.position() + count, QTextCursor.KeepAnchor)
+                edit.removeSelectedText()
+            else:
+                edit.insertText('    ')
+            block = block.previous()
+        edit.endEditBlock()
+        cursor.setPosition(self.document().findBlockByNumber(first_number).position())
+        block = self.document().findBlockByNumber(last_number)
+        cursor.setPosition(block.position() + len(block.text()), QTextCursor.KeepAnchor)
+        self.setTextCursor(cursor)
+        self.completer.popup().hide()
+
+    # ----------------------------------------------------------------- mouse
+    def mouseReleaseEvent(self, e):
+        super().mouseReleaseEvent(e)
+        if not self.vim:
             return
-        if text in ('f','F','t','T'):
-            self.find_wait=(1 if text.islower() else -1,text in ('t','T'),min(int(self.count or '1'),10000))
-            self.count=''
-            return
-        if text in (';',',') and self.last_find:
-            char,direction,till=self.last_find
-            self.find_character(char,direction if text==';' else -direction,till,min(int(self.count or '1'),10000),repeat=True)
-            self.count='';return
-        if ctrl:
-            if key == Qt.Key_R: self.redo(); return
-            if key in (Qt.Key_D, Qt.Key_U):
-                c = self.textCursor()
-                c.movePosition(QTextCursor.Down if key == Qt.Key_D else QTextCursor.Up,
-                               QTextCursor.MoveAnchor, max(1,self.viewport().height()//self.fontMetrics().height()//2))
-                self.setTextCursor(c); return
-            super().keyPressEvent(e); return
-        if text == ':': self.set_mode('COMMAND'); return
-        if text.isdigit() and (text != '0' or self.count): self.count += text; return
-        n = min(int(self.count or '1'), 10000)
-        c = self.textCursor()
-        anchor = QTextCursor.KeepAnchor if self.mode == 'VISUAL' or self.pending in ('d','y','c') else QTextCursor.MoveAnchor
-        motions = {'h':QTextCursor.Left,'j':QTextCursor.Down,'k':QTextCursor.Up,'l':QTextCursor.Right,
-                   'w':QTextCursor.NextWord,'b':QTextCursor.PreviousWord,'e':QTextCursor.EndOfWord,
-                   '0':QTextCursor.StartOfLine,'$':QTextCursor.EndOfLine,'G':QTextCursor.End}
-        if text in motions:
-            c.movePosition(motions[text], anchor, n)
-            if self.pending:
-                self.register = c.selectedText().replace('\u2029','\n')
-                if self.pending in ('d','c'): c.removeSelectedText()
-                change = self.pending == 'c'
-                self.pending = ''
-                if change: self.set_mode('INSERT')
-            self.setTextCursor(c)
-        elif text == 'g':
-            if self.pending == 'g': c.movePosition(QTextCursor.Start, anchor); self.setTextCursor(c); self.pending=''
-            else: self.pending='g'; return
-        elif text in ('d','y','c'):
-            if self.mode == 'VISUAL':
-                self.register=c.selectedText().replace('\u2029','\n')
-                if text != 'y': c.removeSelectedText()
-                self.setTextCursor(c); self.set_mode('INSERT' if text=='c' else 'NORMAL')
-            elif self.pending == text:
-                c.movePosition(QTextCursor.StartOfLine)
-                c.movePosition(QTextCursor.Down,QTextCursor.KeepAnchor,n)
-                if not c.hasSelection(): c.movePosition(QTextCursor.EndOfLine,QTextCursor.KeepAnchor)
-                self.register = c.selectedText().replace('\u2029','\n')
-                if text != 'y': c.removeSelectedText()
-                self.setTextCursor(c); self.set_mode('INSERT' if text=='c' else 'NORMAL')
-            else: self.pending=text; return
-        elif text in ('i','a','I','A','o','O'):
-            if text == 'a': c.movePosition(QTextCursor.Right)
-            if text in ('I','O'): c.movePosition(QTextCursor.StartOfLine)
-            if text in ('A','o'): c.movePosition(QTextCursor.EndOfLine)
-            if text == 'o': c.insertText('\n')
-            if text == 'O': c.insertText('\n'); c.movePosition(QTextCursor.Up)
-            self.setTextCursor(c); self.set_mode('INSERT')
-        elif text == 'v': self.set_mode('VISUAL' if self.mode != 'VISUAL' else 'NORMAL')
-        elif text == 'x':
-            for _ in range(n): c.deleteChar()
-        elif text == 'p': c.insertText(self.register)
-        elif text == 'u': self.undo()
-        elif text == '/':
-            self.command_buffer='/'; self.set_mode('COMMAND')
-        self.count = ''
+        cursor = self.textCursor()
+        engine = self.vim_engine
+        engine.refresh()
+        if cursor.hasSelection() and engine.mode not in ('INSERT', 'REPLACE', 'COMMAND'):
+            a = self.buffer.to_py(cursor.anchor())
+            p = self.buffer.to_py(cursor.position())
+            if engine.mode == 'NORMAL':
+                engine.set_mode('VISUAL')
+            engine.anchor = a
+            engine.pos = max(0, p - 1) if p > a else p
+            self.sync_from_engine()
+        elif engine.mode.startswith('VISUAL') and not (e.modifiers() & Qt.ShiftModifier):
+            engine.set_mode('NORMAL')
+            engine.pos = engine.clamp(self.buffer.to_py(cursor.position()))
+            self.sync_from_engine()
+        elif engine.mode == 'NORMAL':
+            engine.pos = engine.clamp(self.buffer.to_py(cursor.position()))
+            self.sync_from_engine()
+
+    def focusInEvent(self, e):
+        super().focusInEvent(e)
+        self.modeChanged.emit(self.mode)

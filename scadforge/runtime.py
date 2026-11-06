@@ -12,8 +12,8 @@ def expected_versions():
 
 
 def python_issue():
-    if platform.python_implementation()!='CPython' or not ((3,10)<=sys.version_info[:2]<(3,14)):
-        return 'SCAD Forge 0.7 requires CPython 3.10–3.13 for its pinned Qt wheels.'
+    if platform.python_implementation()!='CPython' or sys.version_info[:2]<(3,10):
+        return 'SCAD Forge requires CPython 3.10 or newer.'
     return None
 
 
@@ -27,11 +27,21 @@ def version_issues():
 
 
 def ensure_or_exit():
+    """Refuse to start with a missing dependency; warn (only) about other versions.
+
+    SCADFORGE_STRICT=1 restores the strict exact-version check.
+    """
+    import os
     issue=python_issue()
     issues=version_issues()
-    if issue or issues:
-        print('SCAD Forge cannot start safely with this environment.',file=sys.stderr)
+    missing=[line for line in issues if 'installed missing' in line]
+    strict=os.environ.get('SCADFORGE_STRICT')=='1'
+    if issue or missing or (strict and issues):
+        print('SCAD Forge cannot start with this environment.',file=sys.stderr)
         if issue: print(issue,file=sys.stderr)
-        for line in issues: print('  '+line,file=sys.stderr)
-        print('Run bash run.sh (Linux) or run.bat (Windows) to create the isolated app environment.',file=sys.stderr)
+        for line in (issues if strict else missing): print('  '+line,file=sys.stderr)
+        print('Run bash run.sh (Linux/macOS) or run.bat (Windows) to create the isolated app environment.',file=sys.stderr)
         raise SystemExit(2)
+    if issues:
+        print('SCAD Forge: untested package versions (set SCADFORGE_STRICT=1 to refuse):',file=sys.stderr)
+        for line in issues: print('  '+line,file=sys.stderr)

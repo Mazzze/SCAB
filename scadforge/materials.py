@@ -34,7 +34,9 @@ class SceneMesh(tuple):
 
     @property
     def nbytes(self):
-        return self[2].nbytes+self[3].nbytes+(sum(a.nbytes for a in self.render) if self.render is not None else 0)
+        shared=(self[2],self[3])
+        extra=sum(a.nbytes for a in self.render if not any(a is b for b in shared)) if self.render is not None else 0
+        return self[2].nbytes+self[3].nbytes+extra
 
 
 def combine_material_meshes(parts):
