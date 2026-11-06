@@ -29,6 +29,9 @@ class ProjectMixin:
         middle_layout.addLayout(view_row)
         self.view_target.currentIndexChanged.connect(self.view_target_changed)
         middle_layout.addWidget(self.editor_tabs,1)
+        from .findbar import FindBar
+        self.find_bar=FindBar(lambda:self.editor)
+        middle_layout.addWidget(self.find_bar)
         menu=QMenu('Project',self);self.project_menu_bar.insertMenu(self.help_menu.menuAction(),menu)
         for title,fn,shortcut in [('New project…',self.new_project,''),('Open project…',self.open_project,''),
             ('New module file…',self.new_module_file,''),('Save all',self.save_all,'Ctrl+Alt+S'),
@@ -43,6 +46,9 @@ class ProjectMixin:
         editor.hintChanged.connect(lambda text:self.hint.setText(text or 'Ctrl+Space: completion · F5: compile · Esc: normal mode · :help'))
         editor.modeChanged.connect(lambda text,e=editor:self.mode_label.setText(text) if e is self.editor else None)
         editor.message.connect(self.info)
+        editor.findRequested.connect(lambda replace:self.find_bar.open(replace))
+        editor.findNextRequested.connect(self.find_next)
+        editor.gotoLineRequested.connect(self.goto_line_dialog)
         editor.ex_handler=self.vim_command
         editor.definition_handler=self.goto_definition_word
         editor.context_actions=lambda:[self.actions[n] if n!='-' else None for n in ('go_source','-','color','duplicate','pattern','boolean','thread','animate','-','build')] if hasattr(self,'actions') else []
@@ -276,6 +282,17 @@ class ProjectMixin:
         if path is not None:self.open_document(path)
         if kind=='module':self.editor.select_source(args[0],args[0]+len('module'));self.editor.setFocus()
         elif kind=='variable':self.edit_tree_variable(args[0])
+
+    def find_next(self,backwards=False):
+        if not self.find_bar.find.text():
+            self.find_bar.open(False);return
+        if not self.find_bar.isVisible():self.find_bar.show();self.find_bar.refresh()
+        self.find_bar.next(backwards)
+
+    def goto_line_dialog(self):
+        current=self.editor.textCursor().blockNumber()+1
+        line,ok=QInputDialog.getInt(self,'Go to line','Line:',current,1,max(1,self.editor.blockCount()))
+        if ok:self.editor.goto_line(line-1)
 
     def goto_definition_word(self,word):
         """Jump to a module, function or variable definition anywhere in the project / includes."""

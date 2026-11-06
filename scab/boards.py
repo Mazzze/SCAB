@@ -149,6 +149,7 @@ class BoardsPanel(QWidget):
     poseEdited = Signal(str, object, object)
     visibilityChanged = Signal(str, bool, bool)
     boardSelected = Signal(str)
+    kicadRequested = Signal(str)
 
     def __init__(self):
         super().__init__()
@@ -169,6 +170,11 @@ class BoardsPanel(QWidget):
             button.clicked.connect(lambda _=False, s=signal: s.emit() if s is self.addRequested else
                                    (s.emit(self.current()) if self.current() else None))
             bar.addWidget(button)
+        kicad = QToolButton()
+        kicad.setIcon(icon('kicad'))
+        kicad.setToolTip('Open the selected board in KiCad (saving there updates it here)')
+        kicad.clicked.connect(lambda: self.kicadRequested.emit(self.current()) if self.current() else None)
+        bar.addWidget(kicad)
         remove = QToolButton()
         remove.setText('Remove')
         remove.setToolTip('Unlink the selected board from this file')

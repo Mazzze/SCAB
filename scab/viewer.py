@@ -322,9 +322,68 @@ class Viewer(gl.GLViewWidget):
         self.setCameraPosition(distance=max(10.,float(np.linalg.norm(high-low))*1.8)); self.update()
 
     def highlight(self,start):
+        """Select a SCAD object (by root start) for the selection tint and outline."""
         self.selected=start
-        for item,data in zip(self.meshes,self.scene):item.setColor(item.base_color)
+        if start is not None and start>=0:self.selected_board=None
+        self.apply_selection()
+
+    def select_board(self,ident):
+        self.selected_board=ident
+        if ident:self.selected=-1
+        self.apply_selection()
+
+    SELECT=np.array([0.36,0.56,0.95,1.],dtype=np.float32)
+
+    def tint(self,colors):
+        out=np.array(colors,dtype=np.float32).copy()
+        out[...,:3]=out[...,:3]*.5+self.SELECT[:3]*.5
+        return out
+
+    def apply_selection(self):
+        """Blue tint and outline on the selected SCAD object or board."""
+        selected=getattr(self,'selected',-1)
+        for item,data in zip(self.meshes,self.scene):
+            on=selected is not None and selected>=0 and data[0]==selected
+            if getattr(item,'tinted',False)==on:continue
+            item.tinted=on
+            if item.base_face_colors is not None:
+                item.opts['meshdata'].setFaceColors(self.tint(item.base_face_colors) if on else item.base_face_colors);item.meshDataChanged()
+            item.setColor(tuple(map(float,self.tint(item.base_color))) if on else item.base_color)
+        self.recolor_reference()
+        self.update_selection_outline()
         self.update()
+
+    def selection_bounds(self):
+        selected=getattr(self,'selected',-1)
+        if getattr(self,'selected_board',None):
+            return self.board_bounds(self.selected_board)
+        data=next((s for s in self.scene if selected is not None and selected>=0 and s[0]==selected),None)
+        if data is None:return None
+        return data[2].min(axis=0),data[2].max(axis=0)
+
+    def update_selection_outline(self,matrix=None):
+        for item in getattr(self,'selection_items',[]):self.removeItem(item)
+        self.selection_items=[]
+        bounds=self.selection_bounds()
+        if bounds is None:return
+        low,high=np.asarray(bounds[0],dtype=float),np.asarray(bounds[1],dtype=float)
+        pad=max(.2,float(np.max(high-low))*.015);low,high=low-pad,high+pad
+        corners=np.array([[x,y,z] for x in (low[0],high[0]) for y in (low[1],high[1]) for z in (low[2],high[2])])
+        edges=[(i,j) for i in range(8) for j in range(i+1,8) if bin(i^j).count('1')==1]
+        item=gl.GLLinePlotItem(pos=np.array([corners[k] for pair in edges for k in pair],dtype=np.float32),mode='lines',
+                               color=tuple(map(float,self.SELECT)),width=2,antialias=True)
+        item.setGLOptions('additive')
+        if matrix is not None:item.setTransform(QMatrix4x4(*map(float,np.asarray(matrix).flatten())))
+        self.addItem(item);self.selection_items=[item]
+
+    def recolor_reference(self):
+        groups=getattr(self,'reference_groups',{})
+        board=getattr(self,'selected_board',None)
+        for item in self.reference_items:
+            colors=item.base_face_colors.copy()
+            for mask,rgba in groups.get(item.owner,[]):colors[mask]=rgba
+            if board and item.owner[0]==board:colors=self.tint(colors)
+            item.opts['meshdata'].setFaceColors(colors);item.meshDataChanged()
 
     def camera_rotation(self):
         cached=getattr(self,'_camera_rotation',None)
@@ -398,6 +457,7 @@ class Viewer(gl.GLViewWidget):
         else:
             vector=np.zeros(3);vector[axis]=amount;matrix[:3,:3]=rotation(vector)
             matrix[:3,3]=self.gizmo_center-matrix[:3,:3]@self.gizmo_center
+        for item in getattr(self,'selection_items',[]):item.setTransform(QMatrix4x4(*map(float,matrix.flatten())))
         if getattr(self,'gizmo_board',None):
             base=getattr(self,'board_matrix',{}).get(self.gizmo_board,np.eye(4))
             self.set_board_pose(self.gizmo_board,matrix@base,preview=True);return
@@ -674,6 +734,7 @@ class Viewer(gl.GLViewWidget):
                 item.setDepthValue(-5)   # opaque boards first, so translucent SCAD parts show them through
                 self.addItem(item);self.reference_items.append(item);self.board_items[ident].append(item)
             self.set_board_pose(ident,matrix,update=False)
+        self.recolor_reference();self.update_selection_outline()
         self.update_section()
 
     def set_board_pose(self,ident,matrix,update=True,preview=False):
@@ -689,6 +750,7 @@ class Viewer(gl.GLViewWidget):
                 world=(np.c_[v,np.ones(len(v))]@np.asarray(matrix,dtype=float).T)[:,:3].astype(np.float32)
                 self.reference_data.append((world,f,c));self.reference_owner.append(item.owner)
             self.board_matrix=getattr(self,'board_matrix',{});self.board_matrix[ident]=np.asarray(matrix,dtype=float)
+            if getattr(self,'selected_board',None)==ident:self.update_selection_outline()
         if update:self.update()
 
     def set_reference(self,parts):
@@ -702,10 +764,8 @@ class Viewer(gl.GLViewWidget):
 
     def highlight_reference(self,groups):
         """Recolor reference faces: {(board id, part index): [(face_mask, rgba), ...]}."""
-        for item in self.reference_items:
-            colors=item.base_face_colors.copy()
-            for mask,rgba in groups.get(item.owner,[]):colors[mask]=rgba
-            item.opts['meshdata'].setFaceColors(colors);item.meshDataChanged()
+        self.reference_groups=groups
+        self.recolor_reference()
         self.update()
 
     def set_board_gizmo(self,mode,ident):
