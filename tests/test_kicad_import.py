@@ -79,3 +79,26 @@ def test_clearance_collision_headroom_and_gap():
     assert bad.collides and bad.status(1.0) == 'collision'
     inside, = check([('C1', part, True, 'top')], [box((-1, -1, 0), (6, 6, 12))])
     assert inside.collides
+
+
+def test_silkscreen_parsed():
+    board = parse_board(BOARD)
+    texts = {t.text: t for t in board.silk_text}
+    assert 'SCAB demo board v1' in texts and texts['bottom side'].side == 'bottom'
+    assert texts['C1'].side == 'top' and board.to_scad(texts['C1'].x, texts['C1'].y)[0] == pytest.approx(47, abs=1e-6)
+    assert any(side == 'top' for side, _, _ in board.silk_lines)
+    from scab.kicad_import import silk_scad
+    source = silk_scad(board)
+    assert 'text("SCAB demo board v1"' in source and 'mirror([1, 0, 0])' in source
+
+
+def test_step_model_matches_vrml_twin():
+    pytest.importorskip('cascadio')
+    from scab import step
+    meshes = step.load(BOARD.parent / '3d' / 'usb_c.step')
+    v = np.vstack([m[0] for m in meshes])
+    assert v.min(axis=0) == pytest.approx((-4.47, -3.65, 0), abs=1e-3)
+    assert v.max(axis=0) == pytest.approx((4.47, 3.65, 3.26), abs=1e-3)
+    parts = {p.ref: p for p in part_meshes(parse_board(BOARD))}
+    lo, hi = parts['J1'].box                      # placed like the .wrl: rotated 90 degrees on the top side
+    assert lo[2] == pytest.approx(1.6, abs=1e-4) and (hi - lo)[:2] == pytest.approx((7.3, 8.94), abs=1e-3)

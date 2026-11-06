@@ -27,6 +27,7 @@ from .meshio import load_mesh
 BOARD_COLOR = (0.11, 0.38, 0.22, 1.)
 PAD_COLOR = (0.78, 0.66, 0.36, 1.)
 PLACEHOLDER_COLOR = (0.55, 0.57, 0.62, 0.85)
+SILK_COLOR = (0.93, 0.93, 0.9, 1.)
 
 
 # ------------------------------------------------------------- S-expressions
@@ -126,6 +127,21 @@ class Footprint:
     edge: list = field(default_factory=list)        # local Edge.Cuts segments
     attributes: tuple = ()
     height_hint: float = None
+    silk_lines: list = field(default_factory=list)
+    silk_circles: list = field(default_factory=list)
+    silk_text: list = field(default_factory=list)
+
+
+@dataclass
+class SilkText:
+    text: str
+    x: float              # board KiCad coordinates
+    y: float
+    angle: float
+    size: float
+    thickness: float
+    justify: tuple
+    side: str
 
 
 @dataclass
@@ -138,6 +154,9 @@ class Board:
     origin: tuple = (0., 0.)                        # KiCad coordinates of the SCAD origin
     aux_origin: tuple = None
     title: str = ''
+    silk_lines: list = field(default_factory=list)   # (side, [(x, y), ...] board coords, width)
+    silk_circles: list = field(default_factory=list) # (side, cx, cy, r, width)
+    silk_text: list = field(default_factory=list)
 
     def to_scad(self, x, y):
         return x - self.origin[0], self.origin[1] - y
@@ -282,9 +301,28 @@ def parse_board(path):
                 board.circles.append(pts[1:])
             elif pts:
                 board.segments.append(pts)
+        elif isinstance(node, list) and node and node[0] in ('gr_line', 'gr_arc', 'gr_circle', 'gr_rect', 'gr_poly') \
+                and layer_of(node).endswith('SilkS'):
+            side = 'bottom' if layer_of(node).startswith('B.') else 'top'
+            pts = graphic_points(node)
+            width = stroke_width(node)
+            if pts and pts[0] == 'circle':
+                board.silk_circles.append((side, *pts[1:], width))
+            elif pts:
+                board.silk_lines.append((side, pts, width))
+        elif isinstance(node, list) and node and node[0] == 'gr_text' and layer_of(node).endswith('SilkS'):
+            text = silk_text(node, None, '', board_level=True)
+            if text:
+                board.silk_text.append(text)
     for node in children(root, 'footprint') + children(root, 'module'):
         fp = parse_footprint(node)
         board.footprints.append(fp)
+        for side, local, width in fp.silk_lines:
+            board.silk_lines.append((side, [local_to_board(fp, x, y) for x, y in local], width))
+        for side, cx, cy, r, width in fp.silk_circles:
+            bx, by = local_to_board(fp, cx, cy)
+            board.silk_circles.append((side, bx, by, r, width))
+        board.silk_text.extend(fp.silk_text)
         for local in fp.edge:
             if local and local[0] == 'circle':
                 cx, cy = local_to_board(fp, local[1], local[2])
@@ -300,6 +338,46 @@ def parse_board(path):
     else:
         board.origin = (min(p[0] for p in pts), max(p[1] for p in pts))
     return board
+
+
+def stroke_width(node):
+    stroke = child(node, 'stroke')
+    width = numbers(child(stroke, 'width'), 1) if stroke is not None else numbers(child(node, 'width'), 1)
+    return width[0] if width else .12
+
+
+def silk_text(node, fp, ref, board_level=False):
+    """A visible silkscreen text (fp_text / property / gr_text) in board coordinates."""
+    if node[0] == 'fp_text':
+        value = str(node[2]) if len(node) > 2 else ''
+    elif node[0] == 'property':
+        value = str(node[2]) if len(node) > 2 else ''
+    else:
+        value = str(node[1]) if len(node) > 1 else ''
+    if 'hide' in node or any(isinstance(c, list) and c and c[0] == 'hide' and 'yes' in c for c in node):
+        return None
+    effects = child(node, 'effects')
+    if effects is not None and ('hide' in effects or any(isinstance(c, list) and c and c[0] == 'hide' and 'yes' in c for c in effects)):
+        return None
+    value = value.replace('${REFERENCE}', ref or '').replace('%R', ref or '')
+    if not value.strip() or '${' in value:
+        return None
+    at = numbers(child(node, 'at'))
+    x, y = (at + [0., 0.])[:2]
+    angle = at[2] if len(at) > 2 else 0.
+    size, thickness, justify = 1., .15, ()
+    if effects is not None:
+        font = child(effects, 'font')
+        if font is not None:
+            size = (numbers(child(font, 'size'), 1) or [1.])[0]
+            thickness = (numbers(child(font, 'thickness'), 1) or [.15])[0]
+        just = child(effects, 'justify')
+        if just is not None:
+            justify = tuple(str(v) for v in just[1:])
+    if fp is not None and not board_level:
+        x, y = local_to_board(fp, x, y)
+    side = 'bottom' if layer_of(node).startswith('B.') else 'top'
+    return SilkText(value, x, y, angle, size, thickness, justify, side)
 
 
 def parse_footprint(node):
@@ -347,6 +425,13 @@ def parse_footprint(node):
         pts = graphic_points(graphic)
         if not pts:
             continue
+        if layer.endswith('SilkS'):
+            silk_side = 'bottom' if layer.startswith('B.') else 'top'
+            if pts[0] == 'circle':
+                fp.silk_circles.append((silk_side, pts[1], pts[2], pts[3], stroke_width(graphic)))
+            else:
+                fp.silk_lines.append((silk_side, list(pts), stroke_width(graphic)))
+            continue
         if layer.endswith('CrtYd'):
             if pts[0] == 'circle':
                 _, cx, cy, r = pts
@@ -355,6 +440,12 @@ def parse_footprint(node):
                 fp.courtyard += list(pts)
         elif layer == 'Edge.Cuts':
             fp.edge.append(pts)
+    for text_node in children(node, 'fp_text') + [p for p in children(node, 'property') if layer_of(p).endswith('SilkS')]:
+        if not layer_of(text_node).endswith('SilkS'):
+            continue
+        text = silk_text(text_node, fp, ref)
+        if text:
+            fp.silk_text.append(text)
     for model in children(node, 'model'):
         hide = 'hide' in model or any(isinstance(m, list) and m and m[0] == 'hide' and 'yes' in m for m in model)
         fp.models.append(Model3D(str(model[1]), xyz(child(model, 'offset')) if child(model, 'offset') is not None
@@ -407,13 +498,22 @@ def resolve_model(path_text, board_dir):
     tail = re.sub(r'^\$\{[^}]+\}/?', '', text)
     for base in fallbacks:
         candidates.append(Path(base) / tail)
+    from . import step
+    use_step = step.available()
     out = []
     for candidate in candidates:
-        if candidate.suffix.lower() in ('.step', '.stp', '.stpz'):
+        suffix = candidate.suffix.lower()
+        if suffix in ('.step', '.stp'):
+            # the referenced STEP first (when it can be read), then a VRML twin
+            if use_step:
+                out.append(candidate)
             out.append(candidate.with_suffix('.wrl'))
-        out.append(candidate)
+        else:
+            out.append(candidate)
+            if use_step:
+                out += [candidate.with_suffix('.step'), candidate.with_suffix('.stp')]
     for candidate in out:
-        if candidate.suffix.lower() == '.wrl' and candidate.is_file():
+        if candidate.suffix.lower() in ('.wrl', '.step', '.stp') and candidate.is_file():
             return candidate
     return None
 
@@ -421,10 +521,15 @@ def resolve_model(path_text, board_dir):
 _model_cache = {}
 
 
-def load_model(path):
+def load_model(path, cache_dir=None):
+    """(meshes, units_to_mm) for a .wrl (0.1 inch units) or .step (mm) model."""
     key = (str(path), path.stat().st_mtime_ns)
     if key not in _model_cache:
-        _model_cache[key] = vrml.load(path)
+        if path.suffix.lower() in ('.step', '.stp'):
+            from . import step
+            _model_cache[key] = (step.load(path, cache_dir), 1.)
+        else:
+            _model_cache[key] = (vrml.load(path), 2.54)
     return _model_cache[key]
 
 
@@ -490,7 +595,7 @@ def box_mesh(lo, hi, rgba):
     return v, f, np.tile(np.asarray(rgba, dtype=np.float32), (len(f), 1))
 
 
-def part_meshes(board):
+def part_meshes(board, cache_dir=None):
     out = []
     board_dir = board.path.parent
     for fp in board.footprints:
@@ -506,10 +611,10 @@ def part_meshes(board):
             if path is None:
                 continue
             try:
-                shapes = load_model(path)
-            except (OSError, ValueError):
+                shapes, units = load_model(path, cache_dir)
+            except Exception:   # unreadable model: fall back to the courtyard box
                 continue
-            matrix = placement @ model_matrix(model, 2.54)
+            matrix = placement @ model_matrix(model, units)
             for v, f, rgba in shapes:
                 placed = (np.c_[v, np.ones(len(v))] @ matrix.T)[:, :3].astype(np.float32)
                 vertices.append(placed)
@@ -619,6 +724,39 @@ def board_scad(board, include_pads=False):
     return '\n'.join(lines) + '\n'
 
 
+def silk_scad(board):
+    """OpenSCAD source for the silkscreen (white ink) on both sides."""
+    t = board.thickness
+    lines = ['$fn = 16;']
+
+    def place(side, body):
+        z = t + 0.036 if side == 'top' else -0.048
+        return f'translate([0, 0, {_fmt(z)}]) linear_extrude(height = 0.012) {body}'
+    for side, pts, width in board.silk_lines:
+        scad = [board.to_scad(x, y) for x, y in pts]
+        for (x1, y1), (x2, y2) in zip(scad, scad[1:]):
+            lines.append(place(side, f'hull() {{ translate([{_fmt(x1)}, {_fmt(y1)}]) circle(d = {_fmt(width)}); '
+                                     f'translate([{_fmt(x2)}, {_fmt(y2)}]) circle(d = {_fmt(width)}); }}'))
+    for side, cx, cy, r, width in board.silk_circles:
+        x, y = board.to_scad(cx, cy)
+        lines.append(place(side, f'translate([{_fmt(x)}, {_fmt(y)}]) difference() {{ circle(r = {_fmt(r + width / 2)}, $fn = 48); '
+                                 f'circle(r = {_fmt(max(0, r - width / 2))}, $fn = 48); }}'))
+    for text in board.silk_text:
+        x, y = board.to_scad(text.x, text.y)
+        angle = text.angle % 360
+        if 90 < angle <= 270:           # KiCad keeps text upright
+            angle -= 180
+        halign = 'left' if 'left' in text.justify else 'right' if 'right' in text.justify else 'center'
+        valign = 'top' if 'top' in text.justify else 'bottom' if 'bottom' in text.justify else 'center'
+        if text.side == 'bottom':
+            halign = {'left': 'right', 'right': 'left'}.get(halign, halign)
+        body = (f'text({scad_string(text.text)}, size = {_fmt(text.size / 0.72)}, font = "Liberation Sans:style=Bold", '
+                f'halign = "{halign}", valign = "{valign}");')
+        mirror = 'mirror([1, 0, 0]) ' if text.side == 'bottom' else ''
+        lines.append(place(text.side, f'translate([{_fmt(x)}, {_fmt(y)}]) rotate({_fmt(angle)}) {mirror}{body}'))
+    return '\n'.join(lines) + '\n' if len(lines) > 1 else ''
+
+
 def openscad_mesh(executable, source, cache_dir):
     """Mesh a small SCAD source with OpenSCAD (cached by content)."""
     cache_dir = Path(cache_dir)
@@ -644,13 +782,15 @@ class BoardModel:
     board: Board
     body: tuple                # (vertices, faces) or None
     pads: tuple
+    silk: tuple
     parts: list                # PartMesh
     notes: list = field(default_factory=list)
+    part_offset = 3            # reference_parts(): body, pads, silkscreen, then parts
 
     def reference_parts(self):
-        """[(vertices, faces, face_colors)] for the viewer: body, pads, then one entry per part."""
+        """[(vertices, faces, face_colors)] for the viewer: body, pads, silkscreen, then one entry per part."""
         out = []
-        for mesh, color in ((self.body, BOARD_COLOR), (self.pads, PAD_COLOR)):
+        for mesh, color in ((self.body, BOARD_COLOR), (self.pads, PAD_COLOR), (self.silk, SILK_COLOR)):
             if mesh is not None:
                 v, f = mesh
                 out.append((v, f, np.tile(np.asarray(color, dtype=np.float32), (len(f), 1))))
@@ -661,11 +801,16 @@ class BoardModel:
         return out
 
 
+def step_available():
+    from . import step
+    return step.available()
+
+
 def load_board(path, executable=None, cache_dir=None):
     board = parse_board(path)
     notes = []
     cache_dir = Path(cache_dir) if cache_dir else Path(path).parent / '.scab-cache'
-    body = pads = None
+    body = pads = silk = None
     if executable:
         try:
             body = openscad_mesh(executable, board_scad(board), cache_dir)
@@ -675,14 +820,21 @@ def load_board(path, executable=None, cache_dir=None):
             pads = openscad_mesh(executable, board_scad(board, include_pads=True), cache_dir)
         except (RuntimeError, ValueError, OSError, subprocess.TimeoutExpired) as error:
             notes.append(f'Pads: {error}')
+        source = silk_scad(board)
+        if source:
+            try:
+                silk = openscad_mesh(executable, source, cache_dir)
+            except (RuntimeError, ValueError, OSError, subprocess.TimeoutExpired) as error:
+                notes.append(f'Silkscreen: {error}')
     else:
         notes.append('OpenSCAD not configured: board body not meshed')
-    parts = part_meshes(board)
+    parts = part_meshes(board, cache_dir / 'step')
     missing = [p.ref for p in parts if not p.has_model]
     if missing:
         notes.append('No 3D model found for ' + ', '.join(missing[:12]) + (' …' if len(missing) > 12 else '') +
-                     ' (courtyard box used; set KICAD8_3DMODEL_DIR or add .wrl models)')
-    return BoardModel(board, body, pads, parts, notes)
+                     ' (courtyard box used; set KICAD8_3DMODEL_DIR' + ('' if step_available()
+                                                                       else ', or pip install cascadio to read .step models') + ')')
+    return BoardModel(board, body, pads, silk, parts, notes)
 
 
 # ------------------------------------------------------------ SCAD include

@@ -17,6 +17,7 @@ geometry authority, your files stay portable.
 | **Live KiCad board** | `PCB → Load KiCad board…` shows the real board — outline, pads, holes and the footprints' 3D models — in the same 3D view as your SCAD chassis, and reloads every time you save in KiCad. A generated include gives OpenSCAD the outline, holes and part positions, and the **Clearance** tab flags parts that collide with or come too close to the chassis (e.g. a capacitor that is too tall for the lid). |
 
 ![KiCad board inside an enclosure designed in SCAD](docs/kicad_board.png)
+![Silkscreen and a STEP-modelled USB-C connector on the live board](docs/kicad_silkscreen.png)
 ![Clearance check: the tall capacitor and the header pins hit the lid](docs/kicad_collision.png)
 
 Measured on a PCB-like test model (board with 200 drilled holes + 600 placed
@@ -131,9 +132,12 @@ Design the enclosure while the board is still changing:
 1. `PCB → Load KiCad board…` (or put `// scab: kicad = path/to/board.kicad_pcb`
    in the SCAD file so the board loads with it). The board appears in the 3D view
    at its real position: outline and cutouts from Edge.Cuts, drilled holes,
-   pads, and every footprint's 3D model (VRML `.wrl`; for `.step` references a
-   `.wrl` next to it is used; parts without a model show their courtyard box).
-   KiCad paths such as `${KIPRJMOD}` and `${KICAD8_3DMODEL_DIR}` are resolved.
+   pads, silkscreen (outlines and text, top and bottom) and every footprint's
+   3D model — STEP (`.step`, read with OpenCASCADE through the optional
+   `cascadio` package that `run.sh` installs) or VRML (`.wrl`), whichever the
+   footprint references, with the other one as a fallback. Parts without a
+   model show their courtyard box. KiCad paths such as `${KIPRJMOD}` and
+   `${KICAD8_3DMODEL_DIR}` are resolved.
 2. Each time KiCad saves the board, SCAB reloads it, rewrites
    `kicad/<board>.scad` next to your file and rebuilds.
 3. `include <kicad/board.scad>` gives you, in board coordinates (mm, origin at
@@ -149,6 +153,11 @@ Design the enclosure while the board is still changing:
    headroom above it (below it for bottom-side parts), the smallest gap to the
    model, and whether it collides. Collisions are red and tight parts amber —
    in the list and on the 3D board. Set the minimum clearance at the top.
+
+**Printing the chassis:** `File → Export chassis parts…` (Shift+F6) writes
+one STL per top-level object (e.g. `chassis-base.stl`, `chassis-lid.stl`),
+named after the comment above the object or its module. Objects that draw the
+KiCad board (`kicad_pcb()`) and objects disabled with `%`/`*` are left out.
 
 `examples/kicad_chassis/` is a complete example: a KiCad 7 project with its own
 3D models (`board/`) and `chassis.scad`, an enclosure whose walls follow the
@@ -220,7 +229,8 @@ Layout:
 | `scab/inspector.py`, `inspector_panel.py` | Value provenance and the Inspector UI |
 | `scab/diagnostics.py`, `problems.py` | Error parsing / mapping and the Problems panel |
 | `scab/kicad.py` | `.kicad_pcb` / CSV export |
-| `scab/kicad_import.py`, `vrml.py` | KiCad board + 3D model import, generated SCAD include |
+| `scab/kicad_import.py`, `vrml.py`, `step.py` | KiCad board, silkscreen and 3D model (VRML / STEP) import, generated SCAD include |
+| `scab/export_parts.py` | One STL per chassis object |
 | `scab/clearance.py`, `clearance_panel.py` | Part-versus-chassis collision / headroom / gap check |
 | `scab/icons.py` | Line icon set (drawn SVG) |
 | `tools/make_example_board.py` | Generates the example KiCad project |

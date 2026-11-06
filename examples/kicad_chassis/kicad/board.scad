@@ -12,7 +12,7 @@ kicad_board_holes = [[[4, 41], 3.2, false, "H1"], [[66, 41], 3.2, false, "H2"], 
 kicad_mounting_holes = [[[4, 41], 3.2], [[66, 41], 3.2], [[4, 4], 3.2], [[66, 4], 3.2]];
 // [reference, value, footprint, [x, y], rotation, side, [min x, y, z], [max x, y, z], has_3d_model]
 kicad_parts = [
-    ["J1", "USB_C", "Connector_USB:USB_C_Receptacle_GCT_USB4085", [67.4, 22.5], 90, "top", [63.75, 18.03, 1.6], [71.1, 26.97, 4.86], true],
+    ["J1", "USB_C", "Connector_USB:USB_C_Receptacle_GCT_USB4085", [67.4, 22.5], 90, "top", [63.75, 18.03, 1.6], [71.05, 26.97, 4.86], true],
     ["C1", "220u", "Capacitor_SMD:CP_Elec_6.3x7.7", [47, 15], 0, "top", [43.7, 11.7, 1.6], [50.3, 18.3, 9.3], true],
     ["C2", "100n", "Capacitor_SMD:C_0603_1608Metric", [30, 31], 0, "top", [29.2, 30.6, 1.6], [30.8, 31.4, 2.4], true],
     ["C3", "100n", "Capacitor_SMD:C_0603_1608Metric", [22, 15], 90, "bottom", [21.6, 14.2, -0.8], [22.4, 15.8, 0], true],

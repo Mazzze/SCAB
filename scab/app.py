@@ -144,6 +144,8 @@ def form_dialog(parent, title, fields):
 
 class Window(ProjectMixin,QMainWindow):
     traceReady=Signal(object,object)
+    partsExported=Signal(object,object)
+    exportProgress=Signal(str)
     boardLoaded=Signal(object,object)
 
     def __init__(self, path=None):
@@ -202,6 +204,8 @@ class Window(ProjectMixin,QMainWindow):
         self.source_watcher = QFileSystemWatcher(self)
         self.source_watcher.fileChanged.connect(self.source_file_changed)
         self.boardLoaded.connect(self.board_loaded, Qt.QueuedConnection)
+        self.partsExported.connect(self.parts_exported, Qt.QueuedConnection)
+        self.exportProgress.connect(self.info, Qt.QueuedConnection)
         self.viewer.measured.connect(lambda text: self.info(text))
         self.problems_panel = ProblemsPanel()
         self.problems_panel.goto.connect(self.goto_problem)
@@ -263,6 +267,8 @@ class Window(ProjectMixin,QMainWindow):
         A('undo','Undo',lambda:self.editor.undo(),'Ctrl+Z');A('redo','Redo',lambda:self.editor.redo(),'Ctrl+Shift+Z')
         A('build','Build',self.compile,'F5',tip='Compile the model with OpenSCAD');A('stop','Cancel build',self.cancel_jobs,'Shift+F5')
         A('export','Export STL…',self.export_stl,'F6')
+        A('export_parts','Export chassis parts (one STL per object)…',self.export_parts,'Shift+F6',
+          tip='Every top-level object to its own STL; the KiCad board and %/* objects are left out')
         A('draft','Draft mesh',checkable=True,tip='Cap $fn at 24 for the preview only').toggled.connect(self.draft_mesh.setChecked)
         self.actions['draft'].setChecked(self.draft_mesh.isChecked())
         A('auto','Build while typing',checkable=True).toggled.connect(self.auto.setChecked);self.actions['auto'].setChecked(True)
@@ -307,12 +313,12 @@ class Window(ProjectMixin,QMainWindow):
                 if name=='-':m.addSeparator()
                 else:m.addAction(self.actions[name])
             return m
-        self.file_menu=menu('File',['new','open','save','-','export','camera','-','settings'])
+        self.file_menu=menu('File',['new','open','save','-','export','export_parts','camera','-','settings'])
         self.recent_menu=self.file_menu.addMenu('Open recent');self.refresh_recent_menu()
         menu('Edit',['undo','redo','-','vim','auto'])
         menu('View',['fit','view_iso','view_top','view_front','view_right','-','draft','section','-','camera'])
         menu('Model',['inspect','dimensions','move','rotate','-','color','duplicate','pattern','boolean','thread','animate','-','measure','build','stop'])
-        menu('PCB',['kicad_import','reload','clearance','-','kicad','kicad_export'])
+        menu('PCB',['kicad_import','reload','clearance','-','export_parts','-','kicad','kicad_export'])
         self.project_menu_bar=menus
         self.help_menu=menu('Help',['help'])
         bar=QToolBar();bar.setIconSize(QSize(18,18));bar.setToolButtonStyle(Qt.ToolButtonIconOnly)
@@ -809,7 +815,7 @@ class Window(ProjectMixin,QMainWindow):
             status=r.status(minimum)
             if status in colors:
                 faces=len(model.parts[r.index].faces)
-                groups[2+r.index]=[(np.ones(faces,dtype=bool),colors[status])]
+                groups[model.part_offset+r.index]=[(np.ones(faces,dtype=bool),colors[status])]
         self.viewer.highlight_reference(groups)
         counts=self.clearance_panel.summary(minimum)
         index=self.bottom_tabs.indexOf(self.clearance_panel)
@@ -828,6 +834,46 @@ class Window(ProjectMixin,QMainWindow):
         self.viewer.opts['center']=QVector3D(*map(float,(lo+hi)/2));self.viewer.update()
         fp=part.footprint
         self.info(f'{part.ref} · {fp.value} · {fp.lib} · {fp.side} · top at {hi[2]:.2f} mm' + ('' if part.has_model else ' · no 3D model (courtyard box)'))
+
+    def export_parts(self):
+        if not self.parse():return
+        if not self.executable or not Path(self.executable).is_file():
+            self.error('OpenSCAD was not found. Settings → OpenSCAD path…');return
+        from .export_parts import chassis_parts
+        parts=chassis_parts(self.doc)
+        if not parts:
+            self.info('Nothing to export: no top-level objects besides the KiCad board');return
+        start=str((self.path.parent if self.path else Path.cwd())/'stl')
+        folder=QFileDialog.getExistingDirectory(self,'Folder for the chassis STL files',start)
+        if not folder:return
+        prefix=(self.path.stem+'-') if self.path else ''
+        source,directory,snapshot,target=self.render_context()
+        doc=Document(self.editor.toPlainText())
+        executable=self.executable;t=self.timeline.value()/1000
+        names=', '.join(name for _,name in parts)
+        self.info(f'Exporting {len(parts)} part(s): {names} …')
+        def work():
+            from .export_parts import export
+            from .compiler import stage_project
+            cleanup=lambda:None;where=directory
+            try:
+                if snapshot:where,_,cleanup=stage_project(snapshot,threading.Event())
+                results=export(doc,where,executable,folder,prefix,t,
+                               progress=lambda i,n,name:self.exportProgress.emit(f'Exporting {name} ({i+1}/{n}) …'))
+                self.partsExported.emit(results,folder)
+            finally:
+                cleanup()
+        threading.Thread(target=work,daemon=True,name='export-parts').start()
+
+    def parts_exported(self,results,folder):
+        ok=[name for name,path,_ in results if path]
+        empty=[name for name,path,message in results if not path and message=='empty object']
+        failed=[f'{name}: {message}' for name,path,message in results if not path and message!='empty object']
+        lines=[f'Exported to {folder}:']+[f'  {path.name}' for _,path,_ in results if path]
+        if empty:lines+=['Skipped (no geometry): '+', '.join(empty)]
+        if failed:lines+=['Failed:']+['  '+f for f in failed]
+        self.console.setPlainText('\n'.join(lines));self.bottom_tabs.setCurrentWidget(self.console)
+        self.info(f'Exported {len(ok)} chassis part(s) to {folder}'+(f' · {len(empty)} empty skipped' if empty else '')+(f' · {len(failed)} failed' if failed else ''))
 
     def check_kicad_link(self):
         from .kicad_import import find_kicad_link
