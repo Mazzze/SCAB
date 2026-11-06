@@ -208,6 +208,7 @@ class Window(ProjectMixin,QMainWindow):
         self.boards_panel.poseEdited.connect(self.set_board_pose)
         self.boards_panel.visibilityChanged.connect(self.board_visibility)
         self.boards_panel.boardSelected.connect(self.select_board)
+        self.boards_panel.kicadRequested.connect(lambda ident:self.open_board_in_kicad(ident))
         self.board_watcher = QFileSystemWatcher(self)
         self.board_watcher.fileChanged.connect(self.board_file_changed)
         self.board_timer = QTimer(self); self.board_timer.setSingleShot(True); self.board_timer.timeout.connect(self.reload_kicad)
@@ -306,6 +307,8 @@ class Window(ProjectMixin,QMainWindow):
         A('kicad_export','Export KiCad board…',self.export_kicad,'Ctrl+Shift+K')
         A('clearance','Check PCB clearance',self.run_clearance,'Ctrl+Shift+C',tip='Parts of the loaded KiCad board that hit or come close to the model')
         A('kicad','Insert PCB library',self.insert_pcb_template)
+        A('open_kicad','Open board in KiCad',lambda:self.open_board_in_kicad(),tip='Open the selected board in the KiCad PCB editor; saving there updates it here')
+        A('open_kicad_project','Open KiCad project',lambda:self.open_board_in_kicad(project=True),tip='Open the selected board\'s KiCad project (schematic, PCB, libraries)')
         A('fit','Fit view',self.viewer.fit,'F');A('view_iso','Isometric',lambda:self.set_view(28,-48),'0')
         A('view_top','Top',lambda:self.set_view(90,-90),'7');A('view_front','Front',lambda:self.set_view(0,-90),'1')
         A('view_right','Right',lambda:self.set_view(0,0),'3')
@@ -313,6 +316,16 @@ class Window(ProjectMixin,QMainWindow):
         A('settings','OpenSCAD path…',self.configure_compiler);A('help','Controls',self.help,'F1')
         A('reload','Reload KiCad board',self.reload_kicad)
         A('go_source','Go to source',self.goto_selected_source)
+        A('find','Find…',lambda:self.find_bar.open(False),'Ctrl+F',tip='Find in the current file (Vim normal mode: use /)')
+        A('replace','Find and replace…',lambda:self.find_bar.open(True),'Ctrl+H')
+        self.actions['find_next']=QAction(icon('redo'),'Find next',self);self.actions['find_next'].setShortcut(QKeySequence('F3'))
+        self.actions['find_next'].triggered.connect(lambda:self.find_next(False))
+        self.actions['find_previous']=QAction(icon('undo'),'Find previous',self);self.actions['find_previous'].setShortcut(QKeySequence('Shift+F3'))
+        self.actions['find_previous'].triggered.connect(lambda:self.find_next(True))
+        self.actions['goto_line']=QAction('Go to line…',self);self.actions['goto_line'].setShortcut(QKeySequence('Ctrl+G'))
+        self.actions['goto_line'].triggered.connect(self.goto_line_dialog)
+        self.actions['comment']=QAction('Toggle comment',self);self.actions['comment'].setShortcut(QKeySequence('Ctrl+/'))
+        self.actions['comment'].triggered.connect(lambda:self.editor.toggle_comment_lines())
         for name in ('fit','view_iso','view_top','view_front','view_right','inspect','dimensions','move','rotate'):
             self.actions[name].setShortcutContext(Qt.WidgetWithChildrenShortcut);self.viewer.addAction(self.actions[name])
 
@@ -328,10 +341,10 @@ class Window(ProjectMixin,QMainWindow):
             return m
         self.file_menu=menu('File',['new','open','save','-','export','export_parts','export_step','camera','-','settings'])
         self.recent_menu=self.file_menu.addMenu('Open recent');self.refresh_recent_menu()
-        menu('Edit',['undo','redo','-','vim','auto'])
+        menu('Edit',['undo','redo','-','find','replace','find_next','find_previous','goto_line','comment','-','vim','auto'])
         menu('View',['fit','view_iso','view_top','view_front','view_right','-','draft','section','-','camera'])
         menu('Model',['inspect','dimensions','move','rotate','-','color','duplicate','pattern','boolean','thread','animate','-','measure','build','stop'])
-        menu('PCB',['kicad_import','reload','clearance','-','export_parts','export_step','-','kicad','kicad_export'])
+        menu('PCB',['kicad_import','open_kicad','open_kicad_project','reload','clearance','-','export_parts','export_step','-','kicad','kicad_export'])
         self.project_menu_bar=menus
         self.help_menu=menu('Help',['help'])
         bar=QToolBar();bar.setIconSize(QSize(18,18));bar.setToolButtonStyle(Qt.ToolButtonIconOnly)
@@ -485,6 +498,7 @@ class Window(ProjectMixin,QMainWindow):
 
     def tree_selected(self):
         self.selected_board=None
+        self.viewer.select_board(None)
         items=self.tree.selectedItems()
         self.node=items[0].data(0,Qt.UserRole) if items else None
         if self.node:
@@ -786,11 +800,11 @@ class Window(ProjectMixin,QMainWindow):
         # KiCad saves by replacing the file: watch the new inode as well.
         if Path(name).exists() and name not in self.board_watcher.files():self.board_watcher.addPath(name)
         for entry in self.boards.values():
-            if str(entry.path)==name:
+            if str(entry.path)==name or (entry.model is not None and name in {str(f) for f in getattr(entry.model,'files',())}):
                 timer=getattr(entry,'timer',None)
                 if timer is None:
                     timer=entry.timer=QTimer(self);timer.setSingleShot(True);timer.timeout.connect(lambda i=entry.ident:self.reload_board(i))
-                timer.start(400)
+                timer.start(250)
 
     def reload_kicad(self):
         if not self.boards:
@@ -808,6 +822,12 @@ class Window(ProjectMixin,QMainWindow):
         self.boards_panel.set_boards(list(self.boards.values()))
         def work():
             from .kicad_import import load_board
+            # 1) fast: parse + 3D parts -> include and SCAD rebuild right after the save
+            try:quick=load_board(path,executable,cache,meshes=False)
+            except (OSError,ValueError,RuntimeError) as exc:
+                self.boardLoaded.emit(ident,None,str(exc));return
+            self.boardLoaded.emit(ident,quick,None)
+            # 2) complete: OpenSCAD meshes for the board body, pads and silkscreen
             try:result,error=load_board(path,executable,cache),None
             except (OSError,ValueError,RuntimeError) as exc:result,error=None,str(exc)
             self.boardLoaded.emit(ident,result,error)
@@ -816,14 +836,22 @@ class Window(ProjectMixin,QMainWindow):
     def board_loaded(self,ident,model,error):
         entry=self.boards.get(ident)
         if entry is None:return
-        entry.loading=False
-        if getattr(entry,'reload_again',False):
+        partial=model is not None and getattr(model,'partial',False)
+        if partial and entry.model is not None:
+            # keep showing the previous board body until the new meshes arrive
+            model.body,model.pads,model.silk=entry.model.body,entry.model.pads,entry.model.silk
+        elif partial:
+            model.notes=[n for n in model.notes]
+        entry.loading=partial
+        if not partial and getattr(entry,'reload_again',False):
             entry.reload_again=False;self.reload_board(ident);return
         if model is None:
             entry.error=f'failed: {error}';self.boards_panel.set_boards(list(self.boards.values()))
             self.error(f'KiCad board {ident}: {error}');return
         first=not any(b.model for b in self.boards.values())
         entry.model=model
+        for file in getattr(model,'files',()):
+            if Path(file).exists() and str(file) not in self.board_watcher.files():self.board_watcher.addPath(str(file))
         self.update_board_view()
         if first:self.viewer.fit()
         from .kicad_import import write_include,include_names
@@ -834,7 +862,8 @@ class Window(ProjectMixin,QMainWindow):
         except (OSError,ValueError) as exc:model.notes.append(f'Include not written: {exc}')
         changed=include.exists() and include.read_text(encoding='utf-8')!=before
         self.boards_panel.set_boards(list(self.boards.values()))
-        self.info(f'KiCad board {ident} loaded: {model.board.path.name}'+(' · '+' · '.join(model.notes) if model.notes else ''))
+        if not partial:
+            self.info(f'KiCad board {ident} loaded: {model.board.path.name}'+(' · '+' · '.join(model.notes) if model.notes else ''))
         if changed and f'kicad/{include.name}' in self.editor.toPlainText():self.compile()
         else:self.run_clearance()
 
@@ -924,6 +953,7 @@ class Window(ProjectMixin,QMainWindow):
 
     def select_board(self,ident):
         self.selected_board=ident
+        self.viewer.select_board(ident)
         mode=self.object_tool.currentText()
         if ident and mode in ('Move','Rotate'):self.viewer.set_board_gizmo(mode,ident)
 
@@ -937,7 +967,8 @@ class Window(ProjectMixin,QMainWindow):
     def board_picked(self,ident,index,point):
         entry=self.boards.get(ident)
         if entry is None or entry.model is None:return
-        self.selected_board=ident;self.boards_panel.select(ident)
+        self.selected_board=ident;self.boards_panel.select(ident);self.viewer.select_board(ident)
+        self.tree.blockSignals(True);self.tree.clearSelection();self.tree.blockSignals(False);self.node=None
         model=entry.model
         if index>=model.part_offset:
             part=model.parts[index-model.part_offset];fp=part.footprint
@@ -1138,8 +1169,41 @@ class Window(ProjectMixin,QMainWindow):
         menu.exec(global_pos)
 
     def viewer_context(self,global_pos,pos):
+        found=self.viewer.hit(pos)
+        if found is not None and found[0]=='reference':
+            ident,index=found[1]
+            self.board_picked(ident,index,found[2])
+            self.board_menu(global_pos,ident,index)
+            return
         self.viewer.pick(pos)
         self.model_menu(global_pos)
+
+    def board_menu(self,global_pos,ident,index=None):
+        entry=self.boards.get(ident)
+        if entry is None:return
+        menu=QMenu(self)
+        title=f'Board {ident} · {entry.path.name}'
+        if entry.model is not None and index is not None and index>=entry.model.part_offset:
+            part=entry.model.parts[index-entry.model.part_offset]
+            title=f'{part.ref} · {part.footprint.value} · on {ident}'
+        header=menu.addAction(title);header.setEnabled(False);menu.addSeparator()
+        menu.addAction(icon('kicad'),'Open board in KiCad PCB editor',lambda:self.open_board_in_kicad(ident))
+        menu.addAction(icon('open'),'Open KiCad project',lambda:self.open_board_in_kicad(ident,project=True))
+        menu.addAction(icon('reload'),'Reload from disk',lambda:self.reload_board(ident))
+        menu.addSeparator()
+        menu.addAction(self.actions['move']);menu.addAction(self.actions['rotate'])
+        menu.addAction(icon('rotate'),'Flip board',lambda:self.flip_board(ident))
+        menu.addAction(icon('fit'),'Focus view on board',lambda:self.focus_board(ident))
+        hide=menu.addAction('Hide board');hide.triggered.connect(lambda:self.board_visibility(ident,False,entry.show_parts) or self.boards_panel.rows[ident]['show'].setChecked(False))
+        menu.exec(global_pos)
+
+    def open_board_in_kicad(self,ident=None,project=False):
+        ident=ident or self.selected_board or next(iter(self.boards),None)
+        entry=self.boards.get(ident)
+        if entry is None:
+            self.info('Add a KiCad board first (PCB → Add KiCad board…)');return
+        from .kicad_launch import open_in_kicad
+        self.info(open_in_kicad(entry.path,project))
 
     # ---------------------------------------------------------- recent files
     def remember_recent(self,path):
@@ -1726,6 +1790,8 @@ class Window(ProjectMixin,QMainWindow):
             'KICAD: PCB → Add KiCad board (several, from any project) shows boards with their 3D models next to your chassis and reloads them whenever KiCad saves. '
             'Move/rotate boards in the Boards tab or with Move/Rotate; poses are stored as <name>_pose in the file. File → Export STEP writes model + boards. '
             'include <kicad/board.scad> gives the outline, holes and part positions; the Clearance tab lists parts that collide or are too close.\n'
+            'EDITING (Vim off or Insert mode): Ctrl+F find, Ctrl+H replace, F3 next, Ctrl+G go to line, Ctrl+/ comment, Alt+Up/Down move line, Ctrl+D duplicate.\n'
+            'BOARDS: right-click a board → Open in KiCad; saving in KiCad updates the board and the SCAD model.\n'
             'TOOLS: header icons or right-click the model / object list / editor. I inspect, D dimensions, G move, R rotate, F fit, 0/7/1/3 views. Measure: click two points.\n'
             'PROBLEMS: syntax errors are shown while typing; OpenSCAD errors and warnings after compiling — red/yellow markers in the gutter, wavy underline, hover for the message, click in Problems or :cn to jump.\n\n'
             'Touchpad: left drag = orbit; Shift+left drag = pan; two-finger scroll/pinch = zoom. Middle/right navigation also supported.\n'

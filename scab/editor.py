@@ -243,6 +243,9 @@ class Editor(QPlainTextEdit):
     hintChanged = Signal(str)
     command = Signal(str)
     message = Signal(str)
+    findRequested = Signal(bool)          # True: with replace
+    findNextRequested = Signal(bool)      # True: backwards
+    gotoLineRequested = Signal()
 
     def __init__(self):
         super().__init__()
@@ -264,6 +267,8 @@ class Editor(QPlainTextEdit):
         self.syncing = False
         self.diagnostics = []
         self.diagnostics_by_line = {}
+        self.find_regex = None
+        self.auto_pairs = True
         self.all_words = set(SIGNATURES)
         self.completer = QCompleter(self)
         self.word_model = QStringListModel(self.completer)
@@ -470,9 +475,9 @@ class Editor(QPlainTextEdit):
         self.setExtraSelections(selections)
 
     def search_selections(self):
-        if not self.vim:
-            return []
-        regex = self.vim_engine.highlight_regex()
+        regex = self.find_regex
+        if regex is None and self.vim:
+            regex = self.vim_engine.highlight_regex()
         if regex is None:
             return []
         first = self.firstVisibleBlock()
@@ -501,7 +506,7 @@ class Editor(QPlainTextEdit):
         return out
 
     def update_search_highlight(self, rect, dy):
-        if dy and self.vim and self.vim_engine.highlight_regex() is not None:
+        if dy and (self.find_regex is not None or (self.vim and self.vim_engine.highlight_regex() is not None)):
             QTimer.singleShot(0, self.refresh_decorations)
 
     def bracket_selections(self):
@@ -610,6 +615,9 @@ class Editor(QPlainTextEdit):
 
     def event(self, e):
         # Let Vim own Ctrl+letter keys (Ctrl-R redo, Ctrl-O jumps, Ctrl-V block...)
+        if e.type() == QEvent.ShortcutOverride and self.conventional_mode() and self.is_editing_shortcut(e):
+            e.accept()
+            return True
         if e.type() == QEvent.ShortcutOverride and self.vim:
             mods = e.modifiers()
             if mods == Qt.ControlModifier and Qt.Key_A <= e.key() <= Qt.Key_Z and chr(e.key()) in VIM_CTRL:
@@ -638,6 +646,8 @@ class Editor(QPlainTextEdit):
             return
         if key == '<C-Space>':
             self.popup(True)
+            return
+        if self.conventional_mode() and self.editing_shortcut(e):
             return
         if not self.vim:
             self.conventional_key(e)
@@ -675,8 +685,194 @@ class Editor(QPlainTextEdit):
             return
         super().inputMethodEvent(e)
 
+    # ------------------------------------------------- conventional editing
+    def conventional_mode(self):
+        """Usual editor keys apply without Vim, and in Vim's Insert / Replace mode."""
+        return not self.vim or self.vim_engine.mode in ('INSERT', 'REPLACE')
+
+    @staticmethod
+    def shortcut_name(e):
+        key, mods = e.key(), e.modifiers()
+        ctrl, shift, alt = bool(mods & Qt.ControlModifier), bool(mods & Qt.ShiftModifier), bool(mods & Qt.AltModifier)
+        if ctrl and not alt:
+            name = {Qt.Key_F: 'find', Qt.Key_H: 'replace', Qt.Key_G: 'goto', Qt.Key_Slash: 'comment',
+                    Qt.Key_D: 'duplicate', Qt.Key_Z: 'redo' if shift else 'undo', Qt.Key_Y: 'redo'}.get(key)
+            if name:
+                return name
+        if key == Qt.Key_F3 and not ctrl:
+            return 'previous' if shift else 'next'
+        if alt and not ctrl and key in (Qt.Key_Up, Qt.Key_Down):
+            return 'move_up' if key == Qt.Key_Up else 'move_down'
+        return None
+
+    def is_editing_shortcut(self, e):
+        return self.shortcut_name(e) is not None
+
+    def editing_shortcut(self, e):
+        name = self.shortcut_name(e)
+        if name is None:
+            return False
+        if name in ('find', 'replace'):
+            self.findRequested.emit(name == 'replace')
+        elif name in ('next', 'previous'):
+            self.findNextRequested.emit(name == 'previous')
+        elif name == 'goto':
+            self.gotoLineRequested.emit()
+        elif name == 'undo':
+            self.undo()
+        elif name == 'redo':
+            self.redo()
+        elif name == 'comment':
+            self.toggle_comment_lines()
+        elif name == 'duplicate':
+            self.duplicate_selection()
+        elif name in ('move_up', 'move_down'):
+            self.move_lines(-1 if name == 'move_up' else 1)
+        self.vim_engine.refresh()
+        return True
+
+    def selected_lines(self):
+        cursor = self.textCursor()
+        doc = self.document()
+        start, end = cursor.selectionStart(), cursor.selectionEnd()
+        first = doc.findBlock(start)
+        last = doc.findBlock(end)
+        if end > start and end == last.position() and last.blockNumber() > first.blockNumber():
+            last = last.previous()
+        return first.blockNumber(), last.blockNumber()
+
+    def select_lines(self, first, last):
+        doc = self.document()
+        a, b = doc.findBlockByNumber(first), doc.findBlockByNumber(last)
+        cursor = self.textCursor()
+        cursor.setPosition(a.position())
+        cursor.setPosition(b.position() + len(b.text()), QTextCursor.KeepAnchor)
+        self.setTextCursor(cursor)
+
+    def toggle_comment_lines(self):
+        engine = self.vim_engine
+        engine.refresh()
+        first, last = self.selected_lines()
+        had_selection = self.textCursor().hasSelection()
+        column = self.textCursor().positionInBlock()
+        engine.begin()
+        engine.toggle_comment(first, last)
+        if had_selection:
+            self.select_lines(first, last)
+        else:
+            block = self.document().findBlockByNumber(first)
+            cursor = self.textCursor()
+            cursor.setPosition(block.position() + min(column, len(block.text())))
+            self.setTextCursor(cursor)
+
+    def move_lines(self, direction):
+        engine = self.vim_engine
+        engine.refresh()
+        first, last = self.selected_lines()
+        lines = engine.t.split('\n')
+        if (direction < 0 and first == 0) or (direction > 0 and last >= len(lines) - 1):
+            return
+        column = self.textCursor().positionInBlock()
+        had_selection = self.textCursor().hasSelection()
+        block = lines[first:last + 1]
+        if direction < 0:
+            start, stop = first - 1, last
+            new = block + [lines[first - 1]]
+        else:
+            start, stop = first, last + 1
+            new = [lines[last + 1]] + block
+        a = engine.line_start(start)
+        b = engine.line_end(stop)
+        engine.begin()
+        engine.replace(a, b, '\n'.join(new))
+        first, last = first + direction, last + direction
+        if had_selection:
+            self.select_lines(first, last)
+        else:
+            target = self.document().findBlockByNumber(first)
+            cursor = self.textCursor()
+            cursor.setPosition(target.position() + min(column, len(target.text())))
+            self.setTextCursor(cursor)
+
+    def duplicate_selection(self):
+        engine = self.vim_engine
+        engine.refresh()
+        cursor = self.textCursor()
+        selected = cursor.selectedText()
+        engine.begin()
+        if selected and '\u2029' not in selected:
+            end = self.buffer.to_py(cursor.selectionEnd())
+            text = selected
+            engine.replace(end, end, text)
+            cursor.setPosition(self.buffer.to_qt(end))
+            cursor.setPosition(self.buffer.to_qt(end + len(text)), QTextCursor.KeepAnchor)
+            self.setTextCursor(cursor)
+            return
+        first, last = self.selected_lines()
+        column = cursor.positionInBlock()
+        b = engine.line_end(last)
+        text = engine.t[engine.line_start(first):b]
+        engine.replace(b, b, '\n' + text)
+        offset = last - first + 1
+        if cursor.hasSelection():
+            self.select_lines(first + offset, last + offset)
+        else:
+            target = self.document().findBlockByNumber(first + offset)
+            moved = self.textCursor()
+            moved.setPosition(target.position() + min(column, len(target.text())))
+            self.setTextCursor(moved)
+
+    PAIRS = {'(': ')', '[': ']', '{': '}', '"': '"'}
+
     def conventional_key(self, e):
         key, mods = e.key(), e.modifiers()
+        text = e.text()
+        cursor = self.textCursor()
+        block_text = cursor.block().text()
+        column = cursor.positionInBlock()
+        after = block_text[column:column + 1]
+        before = block_text[column - 1:column] if column else ''
+        if key == Qt.Key_Home and not mods & (Qt.ControlModifier | Qt.AltModifier):
+            indent = len(block_text) - len(block_text.lstrip())
+            target = indent if column != indent else 0
+            move = QTextCursor.KeepAnchor if mods & Qt.ShiftModifier else QTextCursor.MoveAnchor
+            cursor.setPosition(cursor.block().position() + target, move)
+            self.setTextCursor(cursor)
+            return
+        if self.auto_pairs and text and not mods & (Qt.ControlModifier | Qt.AltModifier):
+            if text in self.PAIRS:
+                closing = self.PAIRS[text]
+                if cursor.hasSelection():
+                    selected = cursor.selectedText()
+                    cursor.insertText(text + selected + closing)
+                    return
+                in_string = block_text[:column].count('"') % 2 == 1
+                if text == '"' and after == '"':
+                    cursor.movePosition(QTextCursor.Right)
+                    self.setTextCursor(cursor)
+                    return
+                if (not after or after in ' \t)]};,') and not (text == '"' and (in_string or before.isalnum())):
+                    cursor.insertText(text + closing)
+                    cursor.movePosition(QTextCursor.Left)
+                    self.setTextCursor(cursor)
+                    return
+            elif text in ')]}' and after == text:
+                cursor.movePosition(QTextCursor.Right)
+                self.setTextCursor(cursor)
+                return
+        if key == Qt.Key_Backspace and not cursor.hasSelection() and self.auto_pairs and before in self.PAIRS \
+                and after == self.PAIRS[before]:
+            cursor.movePosition(QTextCursor.Left)
+            cursor.movePosition(QTextCursor.Right, QTextCursor.KeepAnchor, 2)
+            cursor.removeSelectedText()
+            return
+        if key in (Qt.Key_Return, Qt.Key_Enter) and before == '{' and after == '}':
+            indent = re.match(r'\s*', block_text)[0]
+            cursor.insertText('\n' + indent + '    ' + '\n' + indent)
+            cursor.movePosition(QTextCursor.Up)
+            cursor.movePosition(QTextCursor.EndOfLine)
+            self.setTextCursor(cursor)
+            return
         if key in (Qt.Key_Tab, Qt.Key_Backtab):
             cursor = self.textCursor()
             if cursor.hasSelection() or key == Qt.Key_Backtab:

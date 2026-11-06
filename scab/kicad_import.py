@@ -595,7 +595,7 @@ def box_mesh(lo, hi, rgba):
     return v, f, np.tile(np.asarray(rgba, dtype=np.float32), (len(f), 1))
 
 
-def part_meshes(board, cache_dir=None):
+def part_meshes(board, cache_dir=None, files=None):
     out = []
     board_dir = board.path.parent
     for fp in board.footprints:
@@ -610,6 +610,8 @@ def part_meshes(board, cache_dir=None):
             path = resolve_model(model.path, board_dir)
             if path is None:
                 continue
+            if files is not None:
+                files.add(path)
             try:
                 shapes, units = load_model(path, cache_dir)
             except Exception:   # unreadable model: fall back to the courtyard box
@@ -806,12 +808,15 @@ def step_available():
     return step.available()
 
 
-def load_board(path, executable=None, cache_dir=None):
+def load_board(path, executable=None, cache_dir=None, meshes=True):
+    """Board + 3D parts. meshes=False skips the OpenSCAD-meshed body / pads / silkscreen (fast path)."""
     board = parse_board(path)
     notes = []
     cache_dir = Path(cache_dir) if cache_dir else Path(path).parent / '.scab-cache'
     body = pads = silk = None
-    if executable:
+    if not meshes:
+        pass
+    elif executable:
         try:
             body = openscad_mesh(executable, board_scad(board), cache_dir)
         except (RuntimeError, ValueError, OSError, subprocess.TimeoutExpired) as error:
@@ -828,13 +833,17 @@ def load_board(path, executable=None, cache_dir=None):
                 notes.append(f'Silkscreen: {error}')
     else:
         notes.append('OpenSCAD not configured: board body not meshed')
-    parts = part_meshes(board, cache_dir / 'step')
+    files = set()
+    parts = part_meshes(board, cache_dir / 'step', files)
     missing = [p.ref for p in parts if not p.has_model]
     if missing:
         notes.append('No 3D model found for ' + ', '.join(missing[:12]) + (' …' if len(missing) > 12 else '') +
                      ' (courtyard box used; set KICAD8_3DMODEL_DIR' + ('' if step_available()
                                                                        else ', or pip install cascadio to read .step models') + ')')
-    return BoardModel(board, body, pads, silk, parts, notes)
+    result = BoardModel(board, body, pads, silk, parts, notes)
+    result.partial = not meshes
+    result.files = sorted(str(f) for f in files)     # 3D model files, watched for changes
+    return result
 
 
 # ------------------------------------------------------------ SCAD include

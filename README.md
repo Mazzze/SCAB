@@ -118,6 +118,24 @@ mode and pending keys are shown in the status bar.
 
 `:set rnu` shows relative line numbers for count-based jumps.
 
+### Usual editor keys (Vim off, or in Vim's Insert mode)
+
+| Keys | |
+|---|---|
+| Ctrl+F / Ctrl+H | Find / find and replace (case, whole word, regex with `$1`; Enter next, Shift+Enter previous, Esc closes) |
+| F3 / Shift+F3 | Next / previous match |
+| Ctrl+G | Go to line |
+| Ctrl+/ | Comment / uncomment the line or selected lines |
+| Alt+↑ / Alt+↓ | Move the line or selected lines |
+| Ctrl+D | Duplicate the line (or the selection) |
+| Ctrl+Z / Ctrl+Y | Undo / redo |
+| Home | First non-blank character, then column 0 |
+
+Without Vim, brackets and quotes close automatically, typing the closing one
+steps over it, Backspace removes an empty pair and Enter between `{}` opens an
+indented block. In the Project list, double-clicking a variable selects its
+value: type the new one, Enter applies, Shift+Enter previews.
+
 ## Errors and warnings
 
 * The live parser marks syntax errors as you type (missing `;`, unclosed
@@ -168,6 +186,15 @@ with `<name>_pose = [[x, y, z], [rx, ry, rz]];` and `include <kicad/<name>.scad>
   or select the board (click it in the 3D view or in the list) and use
   **Move (G)** / **Rotate (R)** and drag the arrows. SCAB rewrites
   `<name>_pose` in your file, so undo works and the pose is saved with the design.
+* **Selection**: the object or board you are about to move is tinted blue
+  with a blue outline box, which follows it while you drag.
+* **Edit in KiCad**: right-click a board in the 3D view (or use the Boards tab
+  / `PCB → Open board in KiCad`) to open it in the KiCad PCB editor, or open its
+  whole KiCad project. When you save in KiCad, SCAB re-reads the board and
+  rebuilds the SCAD model right away (about a third of a second); the board
+  body, pads and silkscreen are re-meshed in the background just after. Edited
+  3D model files (`.wrl` / `.step`) are picked up too. Set `SCAB_KICAD` to
+  KiCad's `bin` folder if it is not found automatically.
 * **Boards tab**: show/hide a board, hide only its parts, flip it (180° about
   X), reset its pose, focus the view on it, reload or remove it.
 * **In OpenSCAD** each board has its own prefixed names — `display_parts`,

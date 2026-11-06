@@ -19,6 +19,7 @@ PATHS = {
     'export': '<path d="M12 3v11"/><path d="m8 7 4-4 4 4"/><path d="M4 14v6h16v-6"/>',
     'export_parts': '<rect x="3" y="12" width="8" height="8"/><rect x="13" y="12" width="8" height="8"/><path d="M12 2v7"/><path d="m9 6 3 3 3-3"/>',
     'export_step': '<path d="M9 8 15 5l6 3v7l-6 3-6-3z"/><path d="M9 8l6 3 6-3M15 11v7"/><path d="M2 14h7"/><path d="m6 11 3 3-3 3"/>',
+    'find': '<circle cx="10.5" cy="10.5" r="6.5"/><path d="m15.5 15.5 5 5"/>',
     'draft': '<path d="M12 3 20 8v8l-8 5-8-5V8z"/><path d="M12 3v18M4 8l16 8M20 8 4 16"/>',
     'auto': '<path d="M20 11a8 8 0 0 0-14.5-4.5"/><path d="M5 3v4h4"/><path d="M4 13a8 8 0 0 0 14.5 4.5"/><path d="M19 21v-4h-4"/>',
     'vim': '<rect x="3" y="6" width="18" height="12"/><path d="M7 10l2.5 5L12 10"/><path d="M15 10v5M15 10h2"/>',
@@ -75,7 +76,14 @@ def pixmap(name, color=NORMAL, size=18):
     return pm
 
 
+ALIASES = {'open_kicad': 'kicad', 'open_kicad_project': 'open', 'replace': 'find', 'find_next': 'redo',
+           'find_previous': 'undo'}
+
+
 def icon(name, size=18):
+    name = ALIASES.get(name, name)
+    if name not in PATHS:
+        return QIcon()
     key = (name, size)
     if key not in _cache:
         result = QIcon()
