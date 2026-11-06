@@ -1,0 +1,23 @@
+@echo off
+rem SCAD Forge launcher (Windows): isolated venv, optional Rust engine build, start.
+setlocal
+cd /d "%~dp0"
+if not exist .venv\Scripts\python.exe (
+    echo Creating Python environment in .venv
+    py -3 -m venv .venv || python -m venv .venv
+)
+fc /b requirements.txt .venv\requirements.stamp >nul 2>&1
+if errorlevel 1 (
+    .venv\Scripts\python.exe -m pip install --upgrade pip
+    .venv\Scripts\python.exe -m pip install -r requirements.txt && copy /y requirements.txt .venv\requirements.stamp >nul
+)
+where cargo >nul 2>&1
+if not errorlevel 1 (
+    if not exist rust-engine\target\release\scadforge-engine.exe (
+        echo Building the parallel Rust compile engine
+        pushd rust-engine
+        cargo build --release
+        popd
+    )
+)
+.venv\Scripts\python.exe -m scadforge %*
