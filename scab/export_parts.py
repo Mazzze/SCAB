@@ -32,6 +32,8 @@ def part_name(source, node, index):
         words = head.split()
         if 0 < len(words) <= 4:
             return slug(head)
+        if words:
+            return slug(words[0])
     text = source[node.start:node.end]
     calls = [m.group(1) for m in re.finditer(r'([A-Za-z_]\w*)\s*\(', text)]
     builtin = {'color', 'translate', 'rotate', 'scale', 'mirror', 'multmatrix', 'difference', 'union', 'intersection',

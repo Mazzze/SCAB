@@ -14,10 +14,14 @@ geometry authority, your files stay portable.
 | **See where the SCAD is wrong** | Syntax errors are flagged while you type. OpenSCAD errors and warnings (including failed `assert`s and the module call chain) are mapped back to the right file and line: gutter dots, wavy underline, hover text with a hint, a clickable **Problems** panel, and `:cn` / `:cp` to jump between them. |
 | **Fast compiles of large models** | The Rust engine expands the design once, splits it into pieces, **instances identical geometry** (vias, screws, repeated parts are meshed once), meshes in parallel and caches by content. Editing one part recompiles one part. |
 | **KiCad export** | `PCB → Export KiCad board…` writes a `.kicad_pcb` with the exact Edge.Cuts outline (true arcs), holes and footprints placed by library id, plus a placement CSV. |
+| **Several boards, one model** | Add boards from different KiCad projects, move and rotate each one (Boards tab or the Move/Rotate gizmo), hide them, flip them; their poses live in your SCAD file and the chassis can follow them. Boards are checked against the chassis *and against each other*. |
+| **STEP export** | `File → Export STEP` writes one `.step` with every SCAD object and every board with its 3D parts — named, coloured solids for FreeCAD, Fusion, SolidWorks or KiCad's MCAD workflow. |
 | **Live KiCad board** | `PCB → Load KiCad board…` shows the real board — outline, pads, holes and the footprints' 3D models — in the same 3D view as your SCAD chassis, and reloads every time you save in KiCad. A generated include gives OpenSCAD the outline, holes and part positions, and the **Clearance** tab flags parts that collide with or come too close to the chassis (e.g. a capacitor that is too tall for the lid). |
 
 ![KiCad board inside an enclosure designed in SCAD](docs/kicad_board.png)
 ![Silkscreen and a STEP-modelled USB-C connector on the live board](docs/kicad_silkscreen.png)
+![Two boards from two KiCad projects in one enclosure, placed from the Boards tab](docs/multi_boards.png)
+![Board-to-board clearance: the display lowered onto the main board](docs/multi_collision.png)
 ![Clearance check: the tall capacitor and the header pins hit the lid](docs/kicad_collision.png)
 
 Measured on a PCB-like test model (board with 200 drilled holes + 600 placed
@@ -154,17 +158,49 @@ Design the enclosure while the board is still changing:
    model, and whether it collides. Collisions are red and tight parts amber —
    in the list and on the 3D board. Set the minimum clearance at the top.
 
+### Several boards
+
+Every `// scab: kicad <name> = path` line adds a board; `PCB → Add KiCad board…`
+writes the line for you (pick any `.kicad_pcb`, from any project) together
+with `<name>_pose = [[x, y, z], [rx, ry, rz]];` and `include <kicad/<name>.scad>`.
+
+* **Move a board**: type in the X/Y/Z/rotation fields of the **Boards** tab,
+  or select the board (click it in the 3D view or in the list) and use
+  **Move (G)** / **Rotate (R)** and drag the arrows. SCAB rewrites
+  `<name>_pose` in your file, so undo works and the pose is saved with the design.
+* **Boards tab**: show/hide a board, hide only its parts, flip it (180° about
+  X), reset its pose, focus the view on it, reload or remove it.
+* **In OpenSCAD** each board has its own prefixed names — `display_parts`,
+  `display_part("J1")`, `display_part_box("DS1")`, `display_mounting_holes`,
+  `display_pcb()` — all in board coordinates, and `display_place() { … }`
+  which puts board-coordinate geometry where the board sits. So standoffs, cut
+  outs and windows follow a board when you move it. (The board named `kicad`
+  keeps the plain `kicad_*` names.)
+* **Clearance** checks every part of every board against the model and against
+  all other boards (stacked boards, mezzanine headers, parts under a display).
+
+### STEP export
+
+`File → Export STEP (model + all boards)…` (Ctrl+Shift+E) writes a single
+AP214 `.step`: each SCAD object (split by colour, named after its comment or
+module) and, for every visible board, the board body and each part
+(`display-DS1`, `kicad-C1`, …) as named, coloured solids. Geometry is faceted —
+curved surfaces keep the tessellation of the OpenSCAD model and the 3D models
+(raise `$fn` before exporting for smoother cylinders).
+
 **Printing the chassis:** `File → Export chassis parts…` (Shift+F6) writes
 one STL per top-level object (e.g. `chassis-base.stl`, `chassis-lid.stl`),
 named after the comment above the object or its module. Objects that draw the
 KiCad board (`kicad_pcb()`) and objects disabled with `%`/`*` are left out.
 
-`examples/kicad_chassis/` is a complete example: a KiCad 7 project with its own
-3D models (`board/`) and `chassis.scad`, an enclosure whose walls follow the
-board outline, with standoffs on the mounting holes, a USB-C cutout taken from
-the connector's 3D box and a lid with holes over the button and LEDs. Lower
-`lid_inner` to 7 and the 7.7 mm capacitor turns red. `tools/make_example_board.py`
-regenerates the board.
+`examples/kicad_chassis/` is a complete example with two KiCad 7 projects —
+`board/` (main board) and `display/` (a display board with a down-pointing
+header) — with their own 3D models, and `chassis.scad`: an enclosure whose walls
+follow the main board, standoffs on its mounting holes, standoffs carrying the
+display board 14 mm above it, a USB-C cutout from the connector's 3D box, and a
+lid with holes for the button and LEDs and a window over the display. Move the
+display down to z = 9 and the capacitor, the debug header and the display's
+header turn red. `tools/make_example_board.py` regenerates both boards.
 
 ## PCB → KiCad workflow
 
@@ -231,6 +267,8 @@ Layout:
 | `scab/kicad.py` | `.kicad_pcb` / CSV export |
 | `scab/kicad_import.py`, `vrml.py`, `step.py` | KiCad board, silkscreen and 3D model (VRML / STEP) import, generated SCAD include |
 | `scab/export_parts.py` | One STL per chassis object |
+| `scab/boards.py` | Board ids, poses in the source, Boards panel |
+| `scab/stepwrite.py` | STEP (AP214) writer for the complete assembly |
 | `scab/clearance.py`, `clearance_panel.py` | Part-versus-chassis collision / headroom / gap check |
 | `scab/icons.py` | Line icon set (drawn SVG) |
 | `tools/make_example_board.py` | Generates the example KiCad project |

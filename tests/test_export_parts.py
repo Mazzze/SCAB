@@ -24,12 +24,13 @@ standoff();
 
 def test_example_chassis_names():
     doc = Document(CHASSIS.read_text())
-    assert [name for _, name in chassis_parts(doc)] == ['base', 'lid']
+    assert [name for _, name in chassis_parts(doc)] == ['base', 'standoffs', 'lid']
 
 
 @pytest.mark.skipif(shutil.which('openscad') is None, reason='OpenSCAD not installed')
 def test_export_writes_one_stl_per_part(tmp_path):
     doc = Document(CHASSIS.read_text())
     results = export(doc, str(CHASSIS.parent), shutil.which('openscad'), tmp_path, 'chassis-')
-    assert [(name, path.name) for name, path, _ in results] == [('base', 'chassis-base.stl'), ('lid', 'chassis-lid.stl')]
+    assert [(name, path.name) for name, path, _ in results] == [('base', 'chassis-base.stl'), ('standoffs', 'chassis-standoffs.stl'),
+                                                                  ('lid', 'chassis-lid.stl')]
     assert all(path.stat().st_size > 1000 for _, path, _ in results)

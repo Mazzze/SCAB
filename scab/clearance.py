@@ -107,12 +107,18 @@ def box_distance(lo, hi, points):
     return np.linalg.norm(d, axis=1)
 
 
-def check(parts, model_meshes, board_thickness=1.6, search=25.):
-    """parts: [(ref, vertices, has_model, side)], model_meshes: [(vertices, faces)] -> [Result]."""
-    if model_meshes:
-        tri = np.vstack([np.asarray(v, dtype=np.float64)[np.asarray(f)] for v, f in model_meshes if len(f)])
-    else:
-        tri = np.zeros((0, 3, 3))
+def check(parts, model_meshes, board_thickness=1.6, search=25., obstacles=()):
+    """parts: [(ref, vertices, has_model, side)] -> [Result].
+
+    model_meshes: closed solids from OpenSCAD — surfaces, and 'part inside material'.
+    obstacles: other meshes (e.g. other boards and their 3D models, often open
+    surfaces) — they count for surface intersection, headroom and gap only.
+    """
+    def stack(meshes):
+        items = [np.asarray(v, dtype=np.float64)[np.asarray(f)] for v, f in meshes if len(f)]
+        return np.vstack(items) if items else np.zeros((0, 3, 3))
+    solid = stack(model_meshes)
+    tri = stack(list(model_meshes) + list(obstacles))
     tri_lo = tri.min(axis=1) if len(tri) else np.zeros((0, 3))
     tri_hi = tri.max(axis=1) if len(tri) else np.zeros((0, 3))
     results = []
@@ -129,8 +135,8 @@ def check(parts, model_meshes, board_thickness=1.6, search=25.):
             if close.any():
                 shrink = np.minimum((hi - lo) * .02, .02)
                 collides = bool(triangles_box_overlap(candidates[close], lo + shrink, hi - shrink).any())
-            if not collides:
-                collides = inside((lo + hi) / 2, tri)
+            if not collides and len(solid):
+                collides = inside((lo + hi) / 2, solid)
         # headroom: rays from a 3x3 grid on the part's outer face
         xs = np.linspace(lo[0], hi[0], 3)
         ys = np.linspace(lo[1], hi[1], 3)
