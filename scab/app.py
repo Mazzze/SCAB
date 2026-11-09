@@ -209,6 +209,7 @@ class Window(ProjectMixin,QMainWindow):
         self.boards_panel.visibilityChanged.connect(self.board_visibility)
         self.boards_panel.boardSelected.connect(self.select_board)
         self.boards_panel.kicadRequested.connect(lambda ident:self.open_board_in_kicad(ident))
+        self.boards_panel.menuRequested.connect(lambda ident,pos:self.board_menu(pos,ident))
         self.board_watcher = QFileSystemWatcher(self)
         self.board_watcher.fileChanged.connect(self.board_file_changed)
         self.board_timer = QTimer(self); self.board_timer.setSingleShot(True); self.board_timer.timeout.connect(self.reload_kicad)
@@ -240,6 +241,10 @@ class Window(ProjectMixin,QMainWindow):
         self.build_ui()
         self.compile_bar=QProgressBar();self.compile_bar.setRange(0,100);self.compile_bar.setValue(0)
         self.compile_bar.setFixedWidth(230);self.compile_bar.setFormat('Ready')
+        self.board_progress=QProgressBar();self.board_progress.setRange(0,0);self.board_progress.setFixedWidth(220)
+        self.board_progress.setFormat('Loading board…');self.board_progress.setTextVisible(True);self.board_progress.hide()
+        self.board_progress.setToolTip('The 3D parts are shown already; the board body, pads and silkscreen are being built')
+        self.statusBar().addPermanentWidget(self.board_progress)
         self.statusBar().addPermanentWidget(self.compile_bar)
         self.statusBar().addPermanentWidget(self.mode_label)
         self.statusBar().showMessage('Ready · millimetres · OpenSCAD source')
@@ -671,13 +676,63 @@ class Window(ProjectMixin,QMainWindow):
             self.replace_source(source);self.compile()
         except (ValueError,TypeError,KeyError,StopIteration) as error:self.error(str(error))
 
+    def board_selected_for_tools(self):
+        """The selected board, when the tools should act on a board rather than a SCAD object."""
+        ident=getattr(self,'selected_board',None)
+        return ident if ident in getattr(self,'boards',{}) and self.node is None else None
+
+    def board_relative_path(self,ident):
+        entry=self.boards[ident]
+        return os.path.relpath(entry.path,self.path.parent).replace(os.sep,'/') if self.path else str(entry.path)
+
+    def board_size(self,ident):
+        bounds=self.viewer.board_bounds(ident)
+        return (bounds[1]-bounds[0]) if bounds is not None else np.array([50.,50.,2.])
+
+    def add_board_copies(self,ident,poses):
+        from .boards import add_copies
+        source,new=add_copies(self.editor.toPlainText(),ident,self.board_relative_path(ident),poses,self.boards)
+        self.replace_source(source)
+        self.sync_boards()
+        self.info(f'Added {", ".join(new)} (copies of board {ident}) · each can be moved on its own')
+        return new
+
+    def duplicate_board(self,ident):
+        entry=self.boards[ident];size=self.board_size(ident)
+        default=f'[{size[0]+5:.4g}, 0, 0]'
+        text,ok=QInputDialog.getText(self,f'Duplicate board {ident}','Offset of the copy [x, y, z] / mm:',text=default)
+        if not ok:return
+        try:
+            from .parameters import evaluate,Scope
+            offset=[float(v) for v in evaluate(text,Scope('',{}))][:3]
+        except (ValueError,TypeError,SyntaxError):
+            self.info('Enter an offset like [80, 0, 0]');return
+        position,angles=entry.pose
+        self.add_board_copies(ident,[([position[i]+offset[i] for i in range(3)],list(angles))])
+
+    def pattern_board(self,ident):
+        from .boards import BoardPatternDialog,pose_matrix
+        entry=self.boards[ident]
+        dialog=BoardPatternDialog(self,ident,entry.pose,self.board_size(ident))
+        preview=lambda poses:self.viewer.preview_board_copies(ident,[pose_matrix(*p) for p in poses])
+        dialog.previewChanged.connect(preview);preview(dialog.poses())
+        accepted=dialog.exec()
+        self.viewer.clear_ghosts()
+        if accepted:self.add_board_copies(ident,dialog.poses())
+
     def duplicate(self):
+        ident=self.board_selected_for_tools()
+        if ident:
+            self.duplicate_board(ident);return
         node=self.selected()
         if not node: return
         offset,ok=QInputDialog.getText(self,'Duplicate object','Offset [x, y, z] / mm:',text='[15, 0, 0]')
         if ok: self.replace_source(self.doc.duplicate(node,offset))
 
     def pattern(self):
+        ident=self.board_selected_for_tools()
+        if ident:
+            self.pattern_board(ident);return
         node=self.selected()
         if not node:return
         if node not in self.doc.roots or not self.view_matches_editor():
@@ -797,6 +852,7 @@ class Window(ProjectMixin,QMainWindow):
         self.reload_board(ident)
 
     def board_file_changed(self,name):
+        """A board (or one of its 3D models) changed on disk: reload every instance of it."""
         # KiCad saves by replacing the file: watch the new inode as well.
         if Path(name).exists() and name not in self.board_watcher.files():self.board_watcher.addPath(name)
         for entry in self.boards.values():
@@ -817,6 +873,7 @@ class Window(ProjectMixin,QMainWindow):
         if entry.loading:
             entry.reload_again=True;return
         entry.loading=True;entry.error=''
+        self.update_board_progress()
         path=entry.path;executable=self.executable
         cache=(self.project_root or (self.path.parent if self.path else path.parent))/'.scab-cache'
         self.boards_panel.set_boards(list(self.boards.values()))
@@ -843,6 +900,7 @@ class Window(ProjectMixin,QMainWindow):
         elif partial:
             model.notes=[n for n in model.notes]
         entry.loading=partial
+        self.update_board_progress();self.project_tree_later()
         if not partial and getattr(entry,'reload_again',False):
             entry.reload_again=False;self.reload_board(ident);return
         if model is None:
@@ -866,6 +924,14 @@ class Window(ProjectMixin,QMainWindow):
             self.info(f'KiCad board {ident} loaded: {model.board.path.name}'+(' · '+' · '.join(model.notes) if model.notes else ''))
         if changed and f'kicad/{include.name}' in self.editor.toPlainText():self.compile()
         else:self.run_clearance()
+
+    def update_board_progress(self):
+        loading=[e.ident for e in self.boards.values() if e.loading]
+        if loading:
+            self.board_progress.setFormat('Loading board: '+', '.join(loading)+'…')
+            self.board_progress.show()
+        else:
+            self.board_progress.hide()
 
     def update_board_view(self):
         boards=[]
@@ -891,7 +957,12 @@ class Window(ProjectMixin,QMainWindow):
             entry=self.boards.get(ident)
             if entry is None or entry.path!=path:
                 self.boards[ident]=BoardEntry(ident,path,pose=pose)
-                self.open_board(path,ident)
+                twin=next((e for e in self.boards.values() if e.ident!=ident and e.path==path and e.model is not None and not e.loading),None)
+                if twin is not None:
+                    if str(path) not in self.board_watcher.files():self.board_watcher.addPath(str(path))
+                    self.board_loaded(ident,twin.model,None)
+                else:
+                    self.open_board(path,ident)
             elif [list(entry.pose[0]),list(entry.pose[1])]!=[list(pose[0]),list(pose[1])]:
                 entry.pose=pose;moved=True
                 self.viewer.set_board_pose(ident,entry.matrix)
@@ -900,7 +971,11 @@ class Window(ProjectMixin,QMainWindow):
         if links or self.viewer.reference_items:
             if not links:self.viewer.set_boards([])
         self.boards_panel.set_boards(list(self.boards.values()))
+        self.project_tree_later()
         if moved:self.clearance_timer_start()
+
+    def project_tree_later(self):
+        if hasattr(self,'project_timer'):self.project_timer.start(150)
 
     def clearance_timer_start(self):
         if not hasattr(self,'clearance_timer'):
@@ -942,14 +1017,17 @@ class Window(ProjectMixin,QMainWindow):
     def remove_board(self,ident):
         if ident not in self.boards:return
         if QMessageBox.question(self,'Remove board',f'Unlink board "{ident}" from this file? (The KiCad project is not touched.)')!=QMessageBox.Yes:return
-        self.replace_source(remove_link(self.editor.toPlainText(),ident))
+        from .kicad_import import include_names
+        include=include_names(ident,self.boards[ident].path.stem)[0]
+        shared=any(e.ident!=ident and include_names(e.ident,e.path.stem)[0]==include for e in self.boards.values())
+        self.replace_source(remove_link(self.editor.toPlainText(),ident,None if shared else include))
         self.sync_boards();self.update_board_view();self.run_clearance()
 
     def board_visibility(self,ident,visible,parts):
         entry=self.boards.get(ident)
         if entry is None:return
         entry.visible,entry.show_parts=visible,parts
-        self.update_board_view()
+        self.update_board_view();self.project_tree_later()
 
     def select_board(self,ident):
         self.selected_board=ident
@@ -1179,9 +1257,13 @@ class Window(ProjectMixin,QMainWindow):
         self.model_menu(global_pos)
 
     def board_menu(self,global_pos,ident,index=None):
-        entry=self.boards.get(ident)
-        if entry is None:return
         menu=QMenu(self)
+        if self.fill_board_menu(menu,ident,index):menu.exec(global_pos)
+
+    def fill_board_menu(self,menu,ident,index=None):
+        """Board actions shared by the 3D view, the Boards panel and the project tree."""
+        entry=self.boards.get(ident)
+        if entry is None:return False
         title=f'Board {ident} · {entry.path.name}'
         if entry.model is not None and index is not None and index>=entry.model.part_offset:
             part=entry.model.parts[index-entry.model.part_offset]
@@ -1191,11 +1273,48 @@ class Window(ProjectMixin,QMainWindow):
         menu.addAction(icon('open'),'Open KiCad project',lambda:self.open_board_in_kicad(ident,project=True))
         menu.addAction(icon('reload'),'Reload from disk',lambda:self.reload_board(ident))
         menu.addSeparator()
-        menu.addAction(self.actions['move']);menu.addAction(self.actions['rotate'])
+        menu.addAction(icon('move'),'Move board',lambda:self.board_tool(ident,'Move'))
+        menu.addAction(icon('rotate'),'Rotate board',lambda:self.board_tool(ident,'Rotate'))
         menu.addAction(icon('rotate'),'Flip board',lambda:self.flip_board(ident))
         menu.addAction(icon('fit'),'Focus view on board',lambda:self.focus_board(ident))
-        hide=menu.addAction('Hide board');hide.triggered.connect(lambda:self.board_visibility(ident,False,entry.show_parts) or self.boards_panel.rows[ident]['show'].setChecked(False))
-        menu.exec(global_pos)
+        menu.addSeparator()
+        menu.addAction(icon('duplicate'),'Duplicate board…',lambda:self.duplicate_board(ident))
+        menu.addAction(icon('pattern'),'Pattern board…',lambda:self.pattern_board(ident))
+        menu.addSeparator()
+        show=menu.addAction('Show board');show.setCheckable(True);show.setChecked(entry.visible)
+        show.toggled.connect(lambda on:self.set_board_shown(ident,on,entry.show_parts))
+        parts=menu.addAction('Show components');parts.setCheckable(True);parts.setChecked(entry.show_parts)
+        parts.toggled.connect(lambda on:self.set_board_shown(ident,entry.visible,on))
+        menu.addSeparator()
+        menu.addAction('Rename board…',lambda:self.rename_board(ident))
+        menu.addAction('Copy board path',lambda:QApplication.clipboard().setText(str(entry.path)))
+        menu.addAction(icon('error'),'Remove board from design',lambda:self.remove_board(ident))
+        return True
+
+    def board_tool(self,ident,mode):
+        self.select_board(ident);self.boards_panel.select(ident)
+        self.tree.blockSignals(True);self.tree.clearSelection();self.tree.blockSignals(False);self.node=None
+        self.object_tool.setCurrentText(mode);self.viewer.set_board_gizmo(mode,ident)
+
+    def set_board_shown(self,ident,visible,parts):
+        self.board_visibility(ident,visible,parts)
+        self.boards_panel.set_boards(list(self.boards.values()))
+
+    def rename_board(self,ident):
+        from .boards import rename_link
+        from .kicad_import import board_id
+        if ident not in self.boards:return
+        name,ok=QInputDialog.getText(self,'Rename board',f'New id for board "{ident}" (renames {ident}_pose, {ident}_parts, … in this file):',text=ident)
+        name=name.strip()
+        if not ok or not name or name==ident:return
+        if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*',name) or name in self.boards:
+            self.info(f'"{name}" is not a free identifier');return
+        entry=self.boards[ident]
+        self.replace_source(rename_link(self.editor.toPlainText(),ident,name,self.board_relative_path(ident)))
+        selected=self.selected_board==ident
+        self.sync_boards()
+        if selected and name in self.boards:self.select_board(name)
+        self.info(f'Board {ident} renamed to {name}')
 
     def open_board_in_kicad(self,ident=None,project=False):
         ident=ident or self.selected_board or next(iter(self.boards),None)
