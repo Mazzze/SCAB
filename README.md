@@ -156,7 +156,9 @@ Design the enclosure while the board is still changing:
 1. `PCB → Load KiCad board…` (or put `// scab: kicad = path/to/board.kicad_pcb`
    in the SCAD file so the board loads with it). The board appears in the 3D view
    at its real position: outline and cutouts from Edge.Cuts, drilled holes,
-   pads, silkscreen (outlines and text, top and bottom) and every footprint's
+   pads, silkscreen (exactly as KiCad draws it — its stroke font, sizes,
+   justification and mirroring, exported with `kicad-cli`; without
+   `kicad-cli` a close approximation is used) and every footprint's
    3D model — STEP (`.step`, read with OpenCASCADE through the optional
    `cascadio` package that `run.sh` installs) or VRML (`.wrl`), whichever the
    footprint references, with the other one as a fallback. Parts without a
@@ -199,6 +201,22 @@ with `<name>_pose = [[x, y, z], [rx, ry, rz]];` and `include <kicad/<name>.scad>
   KiCad's `bin` folder if it is not found automatically.
 * **Boards tab**: show/hide a board, hide only its parts, flip it (180° about
   X), reset its pose, focus the view on it, reload or remove it.
+* **Loading**: a busy bar in the status bar shows which boards are on their
+  way. The parts and the SCAD include arrive first (well under a second); the
+  board body, pads and silkscreen are meshed directly (no CGAL), about a second
+  for the example boards.
+* **Duplicate / Pattern a board**: select a board and use the Duplicate or
+  Pattern tool (or right-click it). Each copy is a new board id on the same
+  KiCad file with its own `<id>_pose`, so it can be moved on its own; Pattern
+  shows ghost previews while you set count, step and rotation.
+* **Right-click menus**: a board in the 3D view, in the Boards tab or under
+  *KiCad boards* in the Project tree has the same menu — open in KiCad, reload,
+  move/rotate/flip, focus, duplicate, pattern, show/hide board or parts,
+  rename (renames `<id>_pose`, `<id>_parts`, the include, … in the file),
+  copy path and remove. Files in the Project tree can be opened, shown in the
+  file manager or set as the project entry; variables can be edited, jumped to
+  or have their usages highlighted; modules can be jumped to, inserted at the
+  cursor or searched for.
 * **In OpenSCAD** each board has its own prefixed names — `display_parts`,
   `display_part("J1")`, `display_part_box("DS1")`, `display_mounting_holes`,
   `display_pcb()` — all in board coordinates, and `display_place() { … }`
@@ -295,6 +313,7 @@ Layout:
 | `scab/diagnostics.py`, `problems.py` | Error parsing / mapping and the Problems panel |
 | `scab/kicad.py` | `.kicad_pcb` / CSV export |
 | `scab/kicad_import.py`, `vrml.py`, `step.py` | KiCad board, silkscreen and 3D model (VRML / STEP) import, generated SCAD include |
+| `scab/kicad_silk.py`, `meshgen.py` | Exact silkscreen via `kicad-cli` SVG, direct NumPy meshes for pads and silkscreen |
 | `scab/export_parts.py` | One STL per chassis object |
 | `scab/boards.py` | Board ids, poses in the source, Boards panel |
 | `scab/stepwrite.py` | STEP (AP214) writer for the complete assembly |

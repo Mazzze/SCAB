@@ -466,6 +466,19 @@ class Viewer(gl.GLViewWidget):
             if data[0]==self.gizmo_selected:item.setTransform(qt)
         self.update()
 
+    def preview_board_copies(self,ident,matrices):
+        """Translucent previews of board copies at the given 4x4 poses."""
+        self.clear_ghosts()
+        parts,_=self.board_local.get(ident,([],0))
+        for matrix in matrices:
+            qt=QMatrix4x4(*map(float,np.asarray(matrix,dtype=float).flatten()))
+            for index,(vertices,faces,colors) in enumerate(parts):
+                if not len(faces) or index in (1,2):continue
+                item=gl.GLMeshItem(vertexes=vertices,faces=faces,color=(.36,.56,.95,.28),smooth=False,drawEdges=False,glOptions='translucent')
+                item.setTransform(qt);item.setDepthValue(20)
+                self.addItem(item);self.ghosts.append(item)
+        self.update()
+
     def clear_ghosts(self):
         for item in self.ghosts:self.removeItem(item)
         self.ghosts=[]

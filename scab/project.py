@@ -2,12 +2,13 @@
 import json
 import re
 from pathlib import Path
-from PySide6.QtCore import Qt,QTimer,QObject,QEvent
-from PySide6.QtGui import QAction,QTextCursor,QColor,QBrush
-from PySide6.QtWidgets import (QMenu,QTreeWidget,QTreeWidgetItem,QTabWidget,QFileDialog,QInputDialog,
+from PySide6.QtCore import Qt,QTimer,QObject,QEvent,QUrl
+from PySide6.QtGui import QAction,QTextCursor,QColor,QBrush,QDesktopServices
+from PySide6.QtWidgets import (QApplication,QMenu,QTreeWidget,QTreeWidgetItem,QTabWidget,QFileDialog,QInputDialog,
     QMessageBox,QComboBox,QDialog,QVBoxLayout,QHBoxLayout,QLineEdit,QLabel,QDialogButtonBox,QPushButton)
 from .editor import Editor
 from .model import Document,SourceError
+from .icons import icon
 
 class ProjectMixin:
     def setup_documents(self,left_layout,middle_layout):
@@ -16,6 +17,9 @@ class ProjectMixin:
         self.project_tree.setColumnWidth(0,145);self.project_tree.setColumnWidth(1,90)
         self.project_tree.setMinimumHeight(130);self.project_tree.setMaximumHeight(320)
         self.project_tree.itemDoubleClicked.connect(self.project_item_open)
+        self.project_tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.project_tree.customContextMenuRequested.connect(self.project_context_menu)
+        self.project_tree.setToolTip('Double-click to open / edit · right-click for actions')
         project_title=QLabel('Project');project_title.setObjectName('panelTitle')
         left_layout.addWidget(project_title);left_layout.addWidget(self.project_tree,1)
         self.editor_tabs=QTabWidget();self.editor_tabs.setTabsClosable(True);self.editor_tabs.setDocumentMode(True)
@@ -273,6 +277,16 @@ class ProjectMixin:
                     if file==path:
                         item=QTreeWidgetItem(['module '+name,'↗']);item.setData(0,Qt.UserRole,('module',path,a,b));fileitem.addChild(item)
             except (OSError,SourceError):continue
+        boards=getattr(self,'boards',{})
+        if boards:
+            group=QTreeWidgetItem(['KiCad boards',str(len(boards))]);group.setData(0,Qt.UserRole,('boards',None))
+            self.project_tree.addTopLevelItem(group)
+            for ident,entry in boards.items():
+                state='loading…' if entry.loading else 'error' if entry.error else '' if entry.visible else 'hidden'
+                item=QTreeWidgetItem([ident,state or entry.path.name]);item.setData(0,Qt.UserRole,('board',None,ident))
+                item.setToolTip(0,str(entry.path));item.setToolTip(1,entry.error or str(entry.path))
+                if not entry.visible:item.setForeground(0,QBrush(QColor('#7d8188')))
+                group.addChild(item)
         self.project_tree.expandToDepth(1)
 
     def project_item_open(self,item,column=0):
@@ -282,6 +296,75 @@ class ProjectMixin:
         if path is not None:self.open_document(path)
         if kind=='module':self.editor.select_source(args[0],args[0]+len('module'));self.editor.setFocus()
         elif kind=='variable':self.edit_tree_variable(args[0])
+        elif kind=='board':
+            ident=args[0]
+            self.select_board(ident);self.boards_panel.select(ident);self.focus_board(ident)
+
+    def project_context_menu(self,pos):
+        item=self.project_tree.itemAt(pos)
+        global_pos=self.project_tree.viewport().mapToGlobal(pos)
+        data=item.data(0,Qt.UserRole) if item else None
+        menu=QMenu(self)
+        kind=data[0] if data else None
+        if kind=='board':
+            if not self.fill_board_menu(menu,data[2]):return
+        elif kind=='file':
+            path=data[1]
+            menu.addAction(icon('open'),'Open',lambda:self.open_document(path) if path else None).setEnabled(path is not None)
+            if path is not None:
+                menu.addAction('Show in file manager',lambda:QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(path).parent))))
+                menu.addAction('Copy path',lambda:QApplication.clipboard().setText(str(path)))
+                if self.project_root and self.project_entry and Path(path)!=self.project_entry:
+                    menu.addAction('Set as project entry',lambda:self.set_project_entry(path))
+            menu.addSeparator()
+            self.fill_project_menu(menu)
+        elif kind=='variable':
+            path,name=data[1],data[2]
+            menu.addAction(icon('settings'),f'Edit value of {name}…',lambda:(self.open_document(path) if path else None,self.edit_tree_variable(name)))
+            menu.addAction(icon('go_source'),'Go to definition',lambda:self.tree_goto(path,name))
+            menu.addAction(icon('find'),'Find usages',lambda:self.tree_find_usages(path,name))
+            menu.addAction('Copy name',lambda:QApplication.clipboard().setText(name))
+        elif kind=='module':
+            path,a,b=data[1],data[2],data[3]
+            name=item.text(0).split(' ',1)[-1]
+            menu.addAction(icon('go_source'),'Go to definition',lambda:self.project_item_open(item))
+            menu.addAction('Insert call at cursor',lambda:self.tree_insert_call(name))
+            menu.addAction(icon('find'),'Find usages',lambda:self.tree_find_usages(None,name))
+            menu.addAction('Copy name',lambda:QApplication.clipboard().setText(name))
+        else:
+            if kind=='boards':
+                menu.addAction(icon('kicad_import'),'Add KiCad board…',self.load_kicad)
+                menu.addAction(icon('reload'),'Reload all boards',self.reload_kicad)
+            else:
+                self.fill_project_menu(menu)
+        if not menu.isEmpty():menu.exec(global_pos)
+
+    def fill_project_menu(self,menu):
+        menu.addAction(icon('kicad_import'),'Add KiCad board…',self.load_kicad)
+        menu.addAction(icon('new'),'New module file…',self.new_module_file).setEnabled(self.project_root is not None)
+        menu.addAction(icon('open'),'Open project folder…',self.open_project)
+        menu.addAction(icon('reload'),'Refresh',self.refresh_project)
+
+    def set_project_entry(self,path):
+        self.project_entry=Path(path).resolve()
+        manifest=self.project_root/'scab-project.json'
+        try:manifest.write_text(json.dumps({'entry':self.project_entry.relative_to(self.project_root).as_posix()},indent=2)+'\n',encoding='utf-8')
+        except OSError as error:self.error(str(error));return
+        self.view_target.setCurrentIndex(1);self.refresh_project();self.compile()
+
+    def tree_goto(self,path,name):
+        if path is not None:self.open_document(path)
+        self.goto_definition_word(name);self.editor.setFocus()
+
+    def tree_find_usages(self,path,name):
+        if path is not None:self.open_document(path)
+        bar=self.find_bar
+        bar.regex.setChecked(False);bar.word.setChecked(True)
+        bar.find.setText(name);bar.replace_row.setVisible(False);bar.show();bar.refresh();bar.next(False)
+        self.info(f'{len(bar.matches())} uses of {name} in this file · Enter / F3 for the next one')
+
+    def tree_insert_call(self,name):
+        cursor=self.editor.textCursor();cursor.insertText(f'{name}();');self.editor.setFocus()
 
     def find_next(self,backwards=False):
         if not self.find_bar.find.text():

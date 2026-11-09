@@ -726,10 +726,33 @@ def board_scad(board, include_pads=False):
     return '\n'.join(lines) + '\n'
 
 
-def silk_scad(board):
+def silk_scad(board, text_only=False):
     """OpenSCAD source for the silkscreen (white ink) on both sides."""
     t = board.thickness
     lines = ['$fn = 16;']
+    if text_only:
+        for side in ('top', 'bottom'):
+            items = []
+            for text in board.silk_text:
+                if text.side != side:
+                    continue
+                x, y = board.to_scad(text.x, text.y)
+                angle = text.angle % 360
+                if 90 < angle <= 270:
+                    angle -= 180
+                halign = 'left' if 'left' in text.justify else 'right' if 'right' in text.justify else 'center'
+                valign = 'top' if 'top' in text.justify else 'bottom' if 'bottom' in text.justify else 'center'
+                if side == 'bottom':
+                    halign = {'left': 'right', 'right': 'left'}.get(halign, halign)
+                mirror = 'mirror([1, 0, 0]) ' if side == 'bottom' else ''
+                # KiCad's size is the cap height; its stroke font is wide and light
+                items.append(f'translate([{_fmt(x)}, {_fmt(y)}]) rotate({_fmt(angle)}) {mirror}'
+                             f'text({scad_string(text.text)}, size = {_fmt(text.size / 0.7)}, spacing = 1.12, '
+                             f'font = "Liberation Sans", halign = "{halign}", valign = "{valign}");')
+            if items:
+                z = t + 0.036 if side == 'top' else -0.048
+                lines.append(f'translate([0, 0, {_fmt(z)}]) linear_extrude(height = 0.012) union() {{\n  ' + '\n  '.join(items) + '\n}')
+        return '\n'.join(lines) + '\n' if len(lines) > 1 else ''
 
     def place(side, body):
         z = t + 0.036 if side == 'top' else -0.048
@@ -757,6 +780,112 @@ def silk_scad(board):
         mirror = 'mirror([1, 0, 0]) ' if text.side == 'bottom' else ''
         lines.append(place(text.side, f'translate([{_fmt(x)}, {_fmt(y)}]) rotate({_fmt(angle)}) {mirror}{body}'))
     return '\n'.join(lines) + '\n' if len(lines) > 1 else ''
+
+
+def pads_mesh(board):
+    """Copper pads as thin plates (drilled pads as rings) — built directly, no CSG."""
+    from .meshgen import MeshBuilder, pad_outline, ray_hits_outline, circle_outline
+    builder = MeshBuilder()
+    t = board.thickness
+    for fp in board.footprints:
+        for pad in fp.pads:
+            copper = [l for l in pad.layers if l.endswith('.Cu')]
+            if not copper or pad.kind == 'np_thru_hole':
+                continue
+            sides = set()
+            for layer in copper:
+                if layer in ('*.Cu', 'F&B.Cu'):
+                    sides |= {'F', 'B'}
+                else:
+                    sides.add(layer[0])
+            bx, by = local_to_board(fp, pad.x, pad.y)
+            sx, sy = board.to_scad(bx, by)
+            outline = pad_outline(pad.shape, *pad.size, pad.roundrect or .25)
+            a = math.radians(pad.angle)
+            rot = np.array([[math.cos(a), -math.sin(a)], [math.sin(a), math.cos(a)]])
+            place = lambda pts: np.asarray(pts) @ rot.T + (sx, sy)
+            for side in sides:
+                z0, z1 = (t, t + 0.035) if side == 'F' else (-0.035, 0.)
+                if pad.drill > 0:
+                    angles = np.linspace(0, 2 * math.pi, 40, endpoint=False)
+                    outer = ray_hits_outline(outline, angles)
+                    if pad.drill_oval:
+                        dx, dy = pad.drill_oval[0] / 2, pad.drill_oval[1] / 2
+                        inner = np.c_[dx * np.cos(angles), dy * np.sin(angles)]
+                    else:
+                        inner = circle_outline(0, 0, pad.drill / 2, 40)
+                    # keep the ring valid for drills larger than the pad edge
+                    inner = np.where(np.linalg.norm(inner, axis=1, keepdims=True) < np.linalg.norm(outer, axis=1, keepdims=True),
+                                     inner, outer * .98)
+                    builder.ring(place(outer), place(inner), z0, z1)
+                else:
+                    builder.prism(place(outline), z0, z1)
+    return builder.mesh()
+
+
+def silk_mesh(board, executable=None, cache_dir=None, notes=None):
+    """Silkscreen plates: KiCad's own strokes via kicad-cli when available, otherwise our own drawing."""
+    from .meshgen import MeshBuilder, circle_outline
+    from . import kicad_silk
+    t = board.thickness
+    z = {'top': (t + 0.036, t + 0.048), 'bottom': (-0.048, -0.036)}
+    builder = MeshBuilder()
+    layers = None
+    try:
+        layers = kicad_silk.export(board.path, cache_dir)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        layers = None
+    if layers is not None:
+        # sanity: the strokes must lie on (or very near) the board
+        pts = [p for layer in layers.values() for points, _ in layer.strokes for p in points]
+        outline = [p for seg in board.segments for p in seg]
+        if pts and outline:
+            xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+            ox, oy = [p[0] for p in outline], [p[1] for p in outline]
+            if min(xs) < min(ox) - 50 or max(xs) > max(ox) + 50 or min(ys) < min(oy) - 50 or max(ys) > max(oy) + 50:
+                layers = None
+    if layers is not None:
+        for side, layer in layers.items():
+            z0, z1 = z[side]
+            for points, width in layer.strokes:
+                scad = [board.to_scad(x, y) for x, y in points]
+                for a, b in zip(scad, scad[1:]):
+                    builder.capsule(a, b, width, z0, z1)
+            for cx, cy, r, width, filled in layer.circles:
+                x, y = board.to_scad(cx, cy)
+                if filled:
+                    builder.prism(circle_outline(x, y, r + width / 2, 24), z0, z1)
+                elif width > 0:
+                    builder.ring(circle_outline(x, y, r + width / 2, 32), circle_outline(x, y, max(0., r - width / 2), 32), z0, z1)
+            for points in layer.fills:
+                builder.polygon([board.to_scad(x, y) for x, y in points], z0, z1)
+        return builder.mesh(), 'kicad'
+    # fallback: our own lines and circles, OpenSCAD text
+    for side, pts, width in board.silk_lines:
+        z0, z1 = z[side]
+        scad = [board.to_scad(x, y) for x, y in pts]
+        for a, b in zip(scad, scad[1:]):
+            builder.capsule(a, b, width, z0, z1)
+    for side, cx, cy, r, width in board.silk_circles:
+        z0, z1 = z[side]
+        x, y = board.to_scad(cx, cy)
+        builder.ring(circle_outline(x, y, r + width / 2, 32), circle_outline(x, y, max(0., r - width / 2), 32), z0, z1)
+    mesh = builder.mesh()
+    if board.silk_text and executable:
+        try:
+            text = openscad_mesh(executable, silk_scad(board, text_only=True), cache_dir)
+        except (RuntimeError, OSError, subprocess.TimeoutExpired) as error:
+            text = None
+            if notes is not None:
+                notes.append(f'Silkscreen text: {error}')
+        if text is not None:
+            if mesh is None:
+                mesh = text
+            else:
+                mesh = (np.vstack([mesh[0], text[0]]), np.vstack([mesh[1], text[1] + len(mesh[0])]).astype(np.uint32))
+    if notes is not None and board.silk_text:
+        notes.append('Silkscreen text approximated (kicad-cli not found; install KiCad or set SCAB_KICAD for the exact KiCad font)')
+    return mesh, 'approximate'
 
 
 def openscad_mesh(executable, source, cache_dir):
@@ -821,18 +950,12 @@ def load_board(path, executable=None, cache_dir=None, meshes=True):
             body = openscad_mesh(executable, board_scad(board), cache_dir)
         except (RuntimeError, ValueError, OSError, subprocess.TimeoutExpired) as error:
             notes.append(f'Board body: {error}')
-        try:
-            pads = openscad_mesh(executable, board_scad(board, include_pads=True), cache_dir)
-        except (RuntimeError, ValueError, OSError, subprocess.TimeoutExpired) as error:
-            notes.append(f'Pads: {error}')
-        source = silk_scad(board)
-        if source:
-            try:
-                silk = openscad_mesh(executable, source, cache_dir)
-            except (RuntimeError, ValueError, OSError, subprocess.TimeoutExpired) as error:
-                notes.append(f'Silkscreen: {error}')
+        pads = pads_mesh(board)
+        silk, _ = silk_mesh(board, executable, cache_dir, notes)
     else:
         notes.append('OpenSCAD not configured: board body not meshed')
+        pads = pads_mesh(board)
+        silk, _ = silk_mesh(board, None, cache_dir, notes)
     files = set()
     parts = part_meshes(board, cache_dir / 'step', files)
     missing = [p.ref for p in parts if not p.has_model]
