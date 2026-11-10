@@ -157,6 +157,8 @@ class Board:
     silk_lines: list = field(default_factory=list)   # (side, [(x, y), ...] board coords, width)
     silk_circles: list = field(default_factory=list) # (side, cx, cy, r, width)
     silk_text: list = field(default_factory=list)
+    colors: dict = field(default_factory=dict)       # stackup colors: mask / silk / substrate (KiCad text)
+    root: list = field(default=None, repr=False)     # the parsed file (copper is meshed from it on demand)
 
     def to_scad(self, x, y):
         return x - self.origin[0], self.origin[1] - y
@@ -281,10 +283,13 @@ def parse_board(path):
     if not root or root[0] != 'kicad_pcb':
         raise ValueError(f'{path.name} is not a KiCad board file')
     board = Board(path)
+    board.root = root
     general = child(root, 'general')
     thickness = numbers(child(general, 'thickness'), 1) if general is not None else []
     if thickness:
         board.thickness = thickness[0]
+    from .kicad_copper import stackup
+    _, board.colors = stackup(root, board.thickness)
     setup = child(root, 'setup')
     if setup is not None:
         aux = numbers(child(setup, 'aux_axis_origin'), 2)
@@ -916,20 +921,35 @@ class BoardModel:
     silk: tuple
     parts: list                # PartMesh
     notes: list = field(default_factory=list)
-    part_offset = 3            # reference_parts(): body, pads, silkscreen, then parts
+    copper: tuple = None       # (vertices, faces, face colors) of all copper layers, when loaded
+    part_offset = 4            # reference_parts(): body, pads, silkscreen, copper, then parts
 
-    def reference_parts(self):
-        """[(vertices, faces, face_colors)] for the viewer: body, pads, silkscreen, then one entry per part."""
+    def colors(self):
+        """(board body, silkscreen) RGBA from the KiCad stackup (Board Setup → Board Stackup), else defaults."""
+        from .kicad_copper import parse_color, shade_mask, SILK_COLORS
+        mask = parse_color(self.board.colors.get('mask'))
+        silk = parse_color(self.board.colors.get('silk'), SILK_COLORS)
+        return ((*shade_mask(mask), 1.) if mask else BOARD_COLOR), ((*silk, 1.) if silk else SILK_COLOR)
+
+    def reference_parts(self, body_color=None, traces=True):
+        """[(vertices, faces, face_colors)] for the viewer: body, pads, silkscreen, copper, then one entry per part."""
+        board_rgba, silk_rgba = self.colors()
+        if body_color is not None:
+            board_rgba = tuple(body_color[:3]) + (1.,)
         out = []
-        for mesh, color in ((self.body, BOARD_COLOR), (self.pads, PAD_COLOR), (self.silk, SILK_COLOR)):
+        for mesh, color in ((self.body, board_rgba), (self.pads, PAD_COLOR), (self.silk, silk_rgba)):
             if mesh is not None:
                 v, f = mesh
                 out.append((v, f, np.tile(np.asarray(color, dtype=np.float32), (len(f), 1))))
             else:
-                out.append((np.zeros((3, 3), np.float32), np.array([[0, 1, 2]], np.uint32), np.zeros((1, 4), np.float32)))
+                out.append(EMPTY_PART)
+        out.append(self.copper if (traces and self.copper is not None) else EMPTY_PART)
         for part in self.parts:
             out.append((part.vertices, part.faces, part.colors))
         return out
+
+
+EMPTY_PART = (np.zeros((3, 3), np.float32), np.array([[0, 1, 2]], np.uint32), np.zeros((1, 4), np.float32))
 
 
 def step_available():
@@ -937,8 +957,8 @@ def step_available():
     return step.available()
 
 
-def load_board(path, executable=None, cache_dir=None, meshes=True):
-    """Board + 3D parts. meshes=False skips the OpenSCAD-meshed body / pads / silkscreen (fast path)."""
+def load_board(path, executable=None, cache_dir=None, meshes=True, copper=False):
+    """Board + 3D parts. meshes=False skips the body / pads / silkscreen (fast path); copper=True adds the copper layers."""
     board = parse_board(path)
     notes = []
     cache_dir = Path(cache_dir) if cache_dir else Path(path).parent / '.scab-cache'
@@ -964,7 +984,14 @@ def load_board(path, executable=None, cache_dir=None, meshes=True):
                      ' (courtyard box used; set KICAD8_3DMODEL_DIR' + ('' if step_available()
                                                                        else ', or pip install cascadio to read .step models') + ')')
     result = BoardModel(board, body, pads, silk, parts, notes)
+    if meshes and copper:
+        from .kicad_copper import copper_mesh
+        try:
+            result.copper, result.copper_layers = copper_mesh(board, board.root)
+        except (ValueError, IndexError, TypeError) as error:
+            notes.append(f'Copper layers: {error}')
     result.partial = not meshes
+    result.has_copper = bool(meshes and copper)
     result.files = sorted(str(f) for f in files)     # 3D model files, watched for changes
     return result
 

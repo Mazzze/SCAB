@@ -206,13 +206,19 @@ def export(board_path, cache_dir=None, timeout=60):
     for side, layer in (('top', 'F.SilkS'), ('bottom', 'B.SilkS')):
         target = cache / f'silk-{digest}-{side}.svg'
         if not target.exists():
-            partial = target.with_suffix('.part.svg')
-            result = subprocess.run([cli, 'pcb', 'export', 'svg', '--layers', layer, '--exclude-drawing-sheet',
-                                     '--black-and-white', '-o', str(partial), str(board_path)],
-                                    capture_output=True, text=True, timeout=timeout)
-            if result.returncode != 0 or not partial.exists():
-                return None
-            partial.replace(target)
+            # a unique scratch name: several boards (or windows) may export the same file at once
+            handle, partial = tempfile.mkstemp(prefix=f'silk-{digest}-{side}-', suffix='.part.svg', dir=cache)
+            os.close(handle)
+            partial = Path(partial)
+            try:
+                result = subprocess.run([cli, 'pcb', 'export', 'svg', '--layers', layer, '--exclude-drawing-sheet',
+                                         '--black-and-white', '-o', str(partial), str(board_path)],
+                                        capture_output=True, text=True, timeout=timeout)
+                if result.returncode != 0 or not partial.exists() or partial.stat().st_size == 0:
+                    return None
+                partial.replace(target)
+            finally:
+                partial.unlink(missing_ok=True)
         try:
             out[side] = parse_svg(target.read_text(encoding='utf-8', errors='replace'))
         except ET.ParseError:

@@ -15,7 +15,7 @@ class ProjectMixin:
         self.project_root=None;self.project_entry=None;self.buffers={self.editor:None};self.switching=False
         self.project_tree=QTreeWidget();self.project_tree.setHeaderLabels(['Project','Value'])
         self.project_tree.setColumnWidth(0,145);self.project_tree.setColumnWidth(1,90)
-        self.project_tree.setMinimumHeight(130);self.project_tree.setMaximumHeight(320)
+        self.project_tree.setMinimumHeight(60)
         self.project_tree.itemDoubleClicked.connect(self.project_item_open)
         self.project_tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.project_tree.customContextMenuRequested.connect(self.project_context_menu)
