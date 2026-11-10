@@ -164,26 +164,39 @@ class Overlay(QWidget):
                 else:
                     for index in range(len(coords)-1):
                         if valid[index] and valid[index+1]: p.drawLine(QPointF(*coords[index]),QPointF(*coords[index+1]))
-            p.setPen(QPen(QColor('#111214'),2));p.setBrush(color); p.drawRect(QRectF(point.x()-5,point.y()-5,10,10))
+            hot=(v.drag_kind=='dimension' and v.drag_index==i) or (v.hover==('dimension',i) and not v.drag_kind)
+            size=8 if hot else 5
+            p.setPen(QPen(QColor('#ffffff') if hot else QColor('#111214'),2));p.setBrush(color.lighter(135) if hot else color)
+            p.drawRect(QRectF(point.x()-size,point.y()-size,2*size,2*size))
             label_box(f'{h.label} = {value:.4g} mm',point,color)
         if v.gizmo_center is not None and v.transform_mode in ('Move','Rotate'):
-            for axis in range(3):
+            active=v.gizmo_axis if v.drag_kind in ('translate','rotate') else (v.hover[1] if v.hover and v.hover[0]=='gizmo' else None)
+            for axis in sorted(range(3),key=lambda a:a==active):        # the active axis is drawn on top
                 world=v.gizmo_points(axis);coords,valid=v.project_many(world,matrix)
                 if not valid.all():continue
                 poly=QPolygonF([QPointF(float(x),float(y)) for x,y in coords])
-                p.setPen(QPen(QColor('#111214'),5));p.drawPolyline(poly)
-                color=QColor(AXIS_COLORS[axis]);p.setPen(QPen(color,2));p.drawPolyline(poly)
+                color=QColor(AXIS_COLORS[axis]);hot=axis==active
+                if active is not None and not hot:color.setAlpha(110)
+                p.setPen(QPen(QColor('#111214'),8 if hot else 5));p.drawPolyline(poly)
+                p.setPen(QPen(color.lighter(135) if hot else color,4 if hot else 2));p.drawPolyline(poly)
                 endpoint=poly[-1] if v.transform_mode=='Move' else poly[8+axis*8]
-                p.setPen(QPen(QColor('#111214'),2));p.setBrush(color);p.drawRect(QRectF(endpoint.x()-5,endpoint.y()-5,10,10))
+                size=8 if hot else 5
+                p.setPen(QPen(QColor('#ffffff') if hot else QColor('#111214'),2));p.setBrush(color.lighter(135) if hot else color)
+                p.drawRect(QRectF(endpoint.x()-size,endpoint.y()-size,2*size,2*size))
                 label=f'{v.transform_mode} {"XYZ"[axis]}'
-                if v.drag_kind in ('translate','rotate') and v.gizmo_axis==axis:label+=f' {v.drag_value:.3g}'+('°' if v.drag_kind=='rotate' else ' mm')
+                if v.drag_kind in ('translate','rotate') and v.gizmo_axis==axis:
+                    label+=f' {v.drag_value:.4g}'+('°' if v.drag_kind=='rotate' else ' mm')+(' · snap' if getattr(v,'snapping',False) else '')
+                elif hot:label+=' · drag (Shift fine, Ctrl snap)'
                 label_box(label,endpoint,color)
         if v.plane_visible:
             origin,end=v.plane_arrow()
             a,b=project(origin),project(end)
             if a is not None and b is not None:
-                p.setPen(QPen(QColor('#5c8ff2'),2)); p.drawLine(a,b)
-                p.setBrush(QColor('#5c8ff2')); p.drawRect(int(b.x()-6),int(b.y()-6),12,12)
+                hot=v.drag_kind=='plane' or (v.hover==('plane',) and not v.drag_kind)
+                p.setPen(QPen(QColor('#5c8ff2'),4 if hot else 2)); p.drawLine(a,b)
+                size=8 if hot else 6
+                p.setPen(QPen(QColor('#ffffff') if hot else QColor('#111214'),2 if hot else 1))
+                p.setBrush(QColor('#5c8ff2')); p.drawRect(int(b.x()-size),int(b.y()-size),2*size,2*size)
                 label_box(f'Plane {v.section_pos:.3f} mm',b,QColor('#5c8ff2'))
         if v.measure_points:
             pts=[project(q) for q in v.measure_points]
@@ -210,6 +223,7 @@ class Viewer(gl.GLViewWidget):
     boardPicked=Signal(str,int,object)
     boardTransformed=Signal(str,object)
     measured=Signal(str)
+    keyCommand=Signal(str)
     def __init__(self):
         super().__init__()
         self.setBackgroundColor('#2a2c30')
@@ -230,6 +244,8 @@ class Viewer(gl.GLViewWidget):
         self.pick_items=[]
         self.measure_mode=False;self.measure_points=[]
         self.reference=[];self.reference_items=[];self.reference_data=[];self.reference_owner=[];self.board_items={};self.board_local={};self.board_matrix={};self.gizmo_board=None
+        self.hover=None
+        self.setMouseTracking(True);self.setFocusPolicy(Qt.StrongFocus)
         self.overlay=Overlay(self); self.overlay.show()
         self.view_cube=ViewCube(self);self.view_cube.show();self.view_cube.reposition()
 
@@ -473,7 +489,7 @@ class Viewer(gl.GLViewWidget):
         for matrix in matrices:
             qt=QMatrix4x4(*map(float,np.asarray(matrix,dtype=float).flatten()))
             for index,(vertices,faces,colors) in enumerate(parts):
-                if not len(faces) or index in (1,2):continue
+                if not len(faces) or index in (1,2,3):continue
                 item=gl.GLMeshItem(vertexes=vertices,faces=faces,color=(.36,.56,.95,.28),smooth=False,drawEdges=False,glOptions='translucent')
                 item.setTransform(qt);item.setDepthValue(20)
                 self.addItem(item);self.ghosts.append(item)
@@ -563,42 +579,84 @@ class Viewer(gl.GLViewWidget):
         if np.linalg.norm(delta)<.15: return np.array([0.,-self.height()/max(1.,self.opts['distance'])])
         return delta
 
-    def mousePressEvent(self,e):
-        self.press_pos=e.position(); self.mousePos=e.position(); self.moved=False; self.drag_kind=None
-        if e.button()==Qt.LeftButton and self.gizmo_center is not None and self.transform_mode in ('Move','Rotate') and not e.modifiers():
+    def handle_under(self,pos):
+        """The draggable handle under a screen position: ('gizmo', axis, point) / ('plane',) / ('dimension', i) / None."""
+        if self.gizmo_center is not None and self.transform_mode in ('Move','Rotate'):
             candidates=[]
             for axis in range(3):
                 points=self.gizmo_points(axis)
                 if self.transform_mode=='Move':points=points[-1:]
-                for j,world in enumerate(points):
+                for world in points:
                     p=self.project(world)
-                    if p is not None:candidates.append(((p-e.position()).manhattanLength(),axis,j,world))
+                    if p is not None:candidates.append(((p-pos).manhattanLength(),axis,world))
             if candidates:
-                distance,axis,j,point=min(candidates,key=lambda c:c[0])
-                if distance<16:
-                    self.gizmo_axis=axis;self.drag_kind='translate' if self.transform_mode=='Move' else 'rotate'
-                    direction=np.eye(3)[axis] if self.drag_kind=='translate' else np.cross(np.eye(3)[axis],point-self.gizmo_center)*math.pi/180
-                    self.drag_vector=self.drag_projection(point,direction);self.drag_value=self.drag_start_value=0.
-                    self.overlay.update();return
-        if e.button()==Qt.LeftButton and not e.modifiers() & (Qt.ShiftModifier|Qt.AltModifier|Qt.ControlModifier):
-            if self.plane_visible:
-                a,b=self.plane_arrow(); p=self.project(b)
-                if p is not None and (p-e.position()).manhattanLength()<16:
-                    self.drag_kind='plane'; self.drag_value=self.section_pos
-                    self.drag_start_value=self.section_pos; self.drag_vector=self.drag_projection(b,self.section_plane.normal)
-            if self.drag_kind is None:
-                candidates=[]
-                for i,h in enumerate(self.handles):
-                    p=self.project(h.point())
-                    if p is not None: candidates.append(((p-e.position()).manhattanLength(),i))
-                if candidates and min(candidates)[0]<16:
-                    _,self.drag_index=min(candidates); h=self.handles[self.drag_index]
-                    self.drag_kind='dimension'; self.drag_value=self.drag_start_value=h.value
-                    self.drag_vector=self.drag_projection(h.point(),h.direction)
+                distance,axis,point=min(candidates,key=lambda c:c[0])
+                if distance<16:return ('gizmo',axis,point)
+        if self.plane_visible:
+            a,b=self.plane_arrow();p=self.project(b)
+            if p is not None and (p-pos).manhattanLength()<16:return ('plane',)
+        candidates=[]
+        for i,h in enumerate(self.handles):
+            p=self.project(h.point())
+            if p is not None:candidates.append(((p-pos).manhattanLength(),i))
+        if candidates and min(candidates)[0]<16:return ('dimension',min(candidates)[1])
+        return None
+
+    def snap_offset(self,kind,axis):
+        """Absolute value the dragged quantity starts from, so Ctrl snaps to whole steps (boards only)."""
+        board=getattr(self,'gizmo_board',None)
+        if not board:return 0.
+        base=getattr(self,'board_matrix',{}).get(board,np.eye(4))
+        if kind=='translate':return float(base[axis,3])
+        from .boards import pose_from_matrix
+        return float(pose_from_matrix(base)[1][axis])
+
+    def mousePressEvent(self,e):
+        self.press_pos=e.position(); self.mousePos=e.position(); self.moved=False; self.drag_kind=None
+        if e.button()==Qt.LeftButton and not e.modifiers() & Qt.AltModifier:
+            handle=self.handle_under(e.position())
+            if handle and handle[0]=='gizmo':
+                _,axis,point=handle
+                self.gizmo_axis=axis;self.drag_kind='translate' if self.transform_mode=='Move' else 'rotate'
+                direction=np.eye(3)[axis] if self.drag_kind=='translate' else np.cross(np.eye(3)[axis],point-self.gizmo_center)*math.pi/180
+                self.drag_vector=self.drag_projection(point,direction);self.drag_value=self.drag_start_value=0.
+                self.drag_offset=self.snap_offset(self.drag_kind,axis)
+                self.overlay.update();return
+            if handle and handle[0]=='plane':
+                a,b=self.plane_arrow()
+                self.drag_kind='plane'; self.drag_value=self.section_pos;self.drag_offset=0.
+                self.drag_start_value=self.section_pos; self.drag_vector=self.drag_projection(b,self.section_plane.normal)
+            elif handle and handle[0]=='dimension':
+                self.drag_index=handle[1]; h=self.handles[self.drag_index]
+                self.drag_kind='dimension'; self.drag_value=self.drag_start_value=h.value;self.drag_offset=0.
+                self.drag_vector=self.drag_projection(h.point(),h.direction)
         self.overlay.update()
 
+    def cancel_drag(self):
+        if self.drag_kind in ('translate','rotate'):self.preview_transform(self.drag_kind,self.gizmo_axis,0.)
+        elif self.drag_kind=='plane':self.planeMoved.emit(self.drag_start_value)
+        self.drag_kind=None;self.press_pos=None;self.drag_index=-1;self.overlay.update()
+
+    def keyPressEvent(self,e):
+        key=e.key();mods=e.modifiers()&~Qt.KeypadModifier
+        if key==Qt.Key_Escape:
+            if self.drag_kind:self.cancel_drag()
+            else:self.keyCommand.emit('escape')
+            e.accept();return
+        commands={Qt.Key_I:'source',Qt.Key_G:'Move',Qt.Key_R:'Rotate',Qt.Key_D:'Dimensions',Qt.Key_M:'measure',Qt.Key_Delete:'delete'}
+        if key in commands and not mods&(Qt.ControlModifier|Qt.AltModifier|Qt.MetaModifier|Qt.ShiftModifier):
+            self.keyCommand.emit(commands[key]);e.accept();return
+        super().keyPressEvent(e)
+
     def mouseMoveEvent(self,e):
-        if self.press_pos is None: return
+        if self.press_pos is None:
+            handle=self.handle_under(e.position())
+            hover=handle[:2] if handle else None
+            if hover!=self.hover:
+                self.hover=hover
+                self.setCursor(Qt.PointingHandCursor if hover else Qt.ArrowCursor)
+                self.overlay.update()
+            return
         diff=e.position()-self.mousePos; self.mousePos=e.position()
         total=e.position()-self.press_pos
         if total.manhattanLength()>3: self.moved=True
@@ -607,6 +665,12 @@ class Viewer(gl.GLViewWidget):
             precision=.1 if e.modifiers() & Qt.ShiftModifier else 1.
             amount=float(delta@self.drag_vector/max(1e-8,self.drag_vector@self.drag_vector))*precision
             self.drag_value=self.drag_start_value+amount
+            if e.modifiers() & Qt.ControlModifier:
+                # Ctrl: square up — whole mm / 15° steps (with Shift: 0.1 mm / 5°), absolute for boards
+                step=(5. if self.drag_kind=='rotate' else .1) if e.modifiers() & Qt.ShiftModifier else (15. if self.drag_kind=='rotate' else 1.)
+                offset=getattr(self,'drag_offset',0.) if self.drag_kind in ('translate','rotate') else 0.
+                self.drag_value=round((offset+self.drag_value)/step)*step-offset
+            self.snapping=bool(e.modifiers() & Qt.ControlModifier)
             if self.drag_kind in ('translate','rotate'):
                 self.preview_transform(self.drag_kind,self.gizmo_axis,self.drag_value)
             elif self.drag_kind=='dimension':
@@ -643,6 +707,11 @@ class Viewer(gl.GLViewWidget):
         elif e.button()==Qt.RightButton and not self.moved and not self.drag_kind:
             self.contextRequested.emit(e.globalPosition().toPoint(),e.position())
         self.press_pos=None; self.drag_kind=None; self.drag_index=-1; self.overlay.update()
+
+    def leaveEvent(self,e):
+        if self.hover is not None:
+            self.hover=None;self.overlay.update()
+        super().leaveEvent(e)
 
     def wheelEvent(self,e):
         pixels=e.pixelDelta(); delta=pixels.y() if not pixels.isNull() else e.angleDelta().y()

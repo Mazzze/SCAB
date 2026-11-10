@@ -6,7 +6,8 @@ import re
 import numpy as np
 from PySide6.QtCore import Qt, Signal, QTimer
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QTreeWidget, QTreeWidgetItem, QDoubleSpinBox,
-                               QCheckBox, QToolButton, QHeaderView, QDialog, QFormLayout, QSpinBox, QDialogButtonBox)
+                               QCheckBox, QToolButton, QHeaderView, QDialog, QFormLayout, QSpinBox, QDialogButtonBox,
+                               QComboBox, QStackedWidget)
 from .icons import icon
 
 IDENTITY_POSE = ([0., 0., 0.], [0., 0., 0.])
@@ -20,6 +21,8 @@ class BoardEntry:
     pose: tuple = IDENTITY_POSE
     visible: bool = True
     show_parts: bool = True
+    show_traces: bool = False
+    color: tuple = None        # board (solder mask) color override, RGB 0..1; None = KiCad stackup color
     loading: bool = False
     error: str = ''
 
@@ -33,7 +36,7 @@ class BoardEntry:
             return []
         m = self.matrix
         out = []
-        for v, f, c in self.model.reference_parts():
+        for v, f, c in self.model.reference_parts(self.color, False):
             out.append(((np.c_[v, np.ones(len(v))] @ m.T)[:, :3].astype(np.float32), f, c))
         return out
 
@@ -156,8 +159,41 @@ def rename_link(source, old, new, relative_path):
     return ''.join(line if re.match(r'[ \t]*//\s*scab\s*:', line) else use.sub(new + '_', line)
                    for line in source.splitlines(keepends=True))
 
+
+def _link_line(source, ident):
+    named = re.compile(r'^([ \t]*//\s*scab\s*:\s*kicad[ \t]+' + re.escape(ident) + r'\s*=\s*\S+)([^\n]*)', re.M)
+    m = named.search(source or '')
+    if m is None and ident == 'kicad':
+        m = re.search(r'^([ \t]*//\s*scab\s*:\s*kicad\s*=\s*\S+)([^\n]*)', source or '', re.M)
+    return m
+
+
+def link_option(source, ident, key):
+    """Option written after the path on a board's link line, e.g. `// scab: kicad display = d.kicad_pcb color=#2050c0`."""
+    m = _link_line(source, ident)
+    if m is None:
+        return None
+    o = re.search(r'(?:^|\s)' + re.escape(key) + r'=(\S+)', m.group(2))
+    return o.group(1) if o else None
+
+
+def set_link_option(source, ident, key, value):
+    """Set (value) or remove (None) an option on a board's link line."""
+    m = _link_line(source, ident)
+    if m is None:
+        return source
+    rest = re.sub(r'\s*(?<!\S)' + re.escape(key) + r'=\S+', '', m.group(2))
+    if value is not None:
+        rest = f' {key}={value}' + rest
+    return source[:m.start(2)] + rest + source[m.end(2):]
+
+
+def parse_rgb(text):
+    m = re.fullmatch(r'#?([0-9a-fA-F]{6})', (text or '').strip())
+    return tuple(int(m.group(1)[i:i + 2], 16) / 255 for i in (0, 2, 4)) if m else None
+
 # ------------------------------------------------------------------- panel
-COLUMNS = ['Board', 'Show', 'Parts', 'X', 'Y', 'Z', 'Rot X', 'Rot Y', 'Rot Z', 'File']
+COLUMNS = ['Board', 'Show', 'Parts', 'Traces', 'Color', 'X', 'Y', 'Z', 'Rot X', 'Rot Y', 'Rot Z', 'File']
 
 
 class BoardsPanel(QWidget):
@@ -169,6 +205,8 @@ class BoardsPanel(QWidget):
     focusRequested = Signal(str)
     poseEdited = Signal(str, object, object)
     visibilityChanged = Signal(str, bool, bool)
+    tracesChanged = Signal(str, bool)
+    colorRequested = Signal(str)
     boardSelected = Signal(str)
     kicadRequested = Signal(str)
     menuRequested = Signal(str, object)
@@ -211,7 +249,7 @@ class BoardsPanel(QWidget):
         self.tree.setRootIsDecorated(False)
         self.tree.setUniformRowHeights(True)
         self.tree.header().setSectionResizeMode(QHeaderView.Interactive)
-        for column, width in enumerate((90, 44, 44, 78, 78, 78, 70, 70, 70, 260)):
+        for column, width in enumerate((90, 44, 44, 50, 50, 78, 78, 78, 70, 70, 70, 260)):
             self.tree.setColumnWidth(column, width)
         self.tree.currentItemChanged.connect(lambda item, _: self.boardSelected.emit(item.data(0, Qt.UserRole)) if item else None)
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -265,6 +303,15 @@ class BoardsPanel(QWidget):
                                                                                        self.rows[i]['parts'].isChecked()))
         self.tree.setItemWidget(item, 1, show)
         self.tree.setItemWidget(item, 2, parts)
+        traces = QCheckBox()
+        traces.setChecked(entry.show_traces)
+        traces.setToolTip('Copper layers: tracks, vias and zone fills on every layer (loaded on demand; see View → Load PCB copper layers)')
+        traces.toggled.connect(lambda on, i=entry.ident: self.tracesChanged.emit(i, on))
+        self.tree.setItemWidget(item, 3, traces)
+        color = QToolButton()
+        color.setToolTip('Board color (only the board, not the components). Default: the solder mask color from the KiCad stackup')
+        color.clicked.connect(lambda *_, i=entry.ident: self.colorRequested.emit(i))
+        self.tree.setItemWidget(item, 4, color)
         spins = []
         for k in range(6):
             spin = QDoubleSpinBox()
@@ -274,9 +321,9 @@ class BoardsPanel(QWidget):
             spin.setSuffix(' mm' if k < 3 else '°')
             spin.setKeyboardTracking(False)
             spin.valueChanged.connect(lambda *_, i=entry.ident: self.pose_changed(i))
-            self.tree.setItemWidget(item, 3 + k, spin)
+            self.tree.setItemWidget(item, 5 + k, spin)
             spins.append(spin)
-        self.rows[entry.ident] = {'item': item, 'show': show, 'parts': parts, 'spins': spins}
+        self.rows[entry.ident] = {'item': item, 'show': show, 'parts': parts, 'traces': traces, 'color': color, 'spins': spins}
 
     def update_row(self, entry):
         row = self.rows.get(entry.ident)
@@ -285,7 +332,13 @@ class BoardsPanel(QWidget):
         self.updating = True
         try:
             values = list(entry.pose[0]) + list(entry.pose[1])
-            for key, value in (('show', entry.visible), ('parts', entry.show_parts)):
+            rgb = entry.color or (entry.model.colors()[0][:3] if entry.model is not None else None)
+            if rgb is not None:
+                from PySide6.QtGui import QColor
+                hexcolor = QColor.fromRgbF(*map(float, rgb[:3])).name()
+                row['color'].setStyleSheet(f'QToolButton {{ background: {hexcolor}; border: 1px solid #5d6066; min-width: 28px; }}')
+                row['color'].setText('' if entry.color is None else '•')
+            for key, value in (('show', entry.visible), ('parts', entry.show_parts), ('traces', entry.show_traces)):
                 if row[key].isChecked() != value:
                     row[key].blockSignals(True)
                     row[key].setChecked(value)
@@ -333,42 +386,132 @@ def add_copies(source, ident, relative_path, poses, taken):
     return source, new
 
 
+def grid_poses(pose, columns, rows, levels, spacing):
+    """Poses of a columns × rows × levels grid starting at the board (the board itself is left out)."""
+    (position, angles) = pose
+    out = []
+    for k in range(levels):
+        for j in range(rows):
+            for i in range(columns):
+                if i == j == k == 0:
+                    continue
+                offset = (i * spacing[0], j * spacing[1], k * spacing[2])
+                out.append(([position[a] + offset[a] for a in range(3)], list(angles)))
+    return out
+
+
+def circular_poses(pose, count, center, total_angle=360., rotate_boards=True):
+    """`count` boards in total on a circle about a vertical axis through `center` (x, y); copies only."""
+    if count < 2:
+        return []
+    full = abs(abs(total_angle) - 360.) < 1e-9
+    step = total_angle / (count if full else count - 1)
+    matrix = pose_matrix(*pose)
+    out = []
+    for k in range(1, count):
+        a = math.radians(step * k)
+        turn = np.eye(4)
+        turn[:2, :2] = [[math.cos(a), -math.sin(a)], [math.sin(a), math.cos(a)]]
+        c = np.array([center[0], center[1], 0.])
+        turn[:3, 3] = c - turn[:3, :3] @ c
+        moved = turn @ matrix
+        if not rotate_boards:
+            moved[:3, :3] = matrix[:3, :3]
+        position, angles = pose_from_matrix(moved)
+        out.append(([round(float(v), 4) for v in position], [round(float(v), 4) for v in angles]))
+    return out
+
+
 class BoardPatternDialog(QDialog):
-    """Copies of a board: count, step and rotation, with a live preview."""
+    """Copies of a board in a line, a grid or a circle, with a live preview."""
     previewChanged = Signal(object)
 
-    def __init__(self, parent, ident, pose, size):
+    def __init__(self, parent, ident, pose, size, center=None):
         super().__init__(parent)
         self.setWindowTitle(f'Pattern board · {ident}')
         self.pose = pose
-        form = QFormLayout(self)
-        self.count = QSpinBox()
-        self.count.setRange(1, 100)
-        self.count.setValue(2)
+        center = list(center) if center is not None else list(pose[0][:2])
+        layout = QVBoxLayout(self)
+        top = QFormLayout()
+        self.kind = QComboBox()
+        self.kind.addItems(['Linear', 'Grid', 'Circular'])
+        top.addRow('Pattern', self.kind)
+        layout.addLayout(top)
+        self.pages = QStackedWidget()
+        layout.addWidget(self.pages)
+
+        def spin(value, low=-10000, high=10000, suffix=' mm', step=1.):
+            box = QDoubleSpinBox()
+            box.setRange(low, high)
+            box.setDecimals(2)
+            box.setSuffix(suffix)
+            box.setSingleStep(step)
+            box.setValue(round(value, 2))
+            return box
+
+        def count(value, low=1):
+            box = QSpinBox()
+            box.setRange(low, 100)
+            box.setValue(value)
+            return box
+        # linear
+        page = QWidget()
+        form = QFormLayout(page)
+        self.count = count(2)
         form.addRow('Copies', self.count)
-        self.step = []
-        for axis, value in zip('XYZ', (size[0] + 5., 0., 0.)):
-            spin = QDoubleSpinBox()
-            spin.setRange(-10000, 10000)
-            spin.setDecimals(2)
-            spin.setSuffix(' mm')
-            spin.setValue(round(value, 2))
-            form.addRow(f'Step {axis}', spin)
-            self.step.append(spin)
-        self.rotate = QDoubleSpinBox()
-        self.rotate.setRange(-360, 360)
-        self.rotate.setSuffix('°')
+        self.step = [spin(v) for v in (size[0] + 5., 0., 0.)]
+        for axis, box in zip('XYZ', self.step):
+            form.addRow(f'Step {axis}', box)
+        self.rotate = spin(0., -360, 360, '°', 15.)
         form.addRow('Rotate each copy (Z)', self.rotate)
+        self.pages.addWidget(page)
+        # grid
+        page = QWidget()
+        form = QFormLayout(page)
+        self.columns, self.rows, self.levels = count(2), count(2), count(1)
+        form.addRow('Columns (X)', self.columns)
+        form.addRow('Rows (Y)', self.rows)
+        form.addRow('Layers (Z)', self.levels)
+        self.spacing = [spin(v) for v in (size[0] + 5., size[1] + 5., max(10., size[2] + 8.))]
+        for axis, box in zip('XYZ', self.spacing):
+            form.addRow(f'Spacing {axis}', box)
+        self.pages.addWidget(page)
+        # circular
+        page = QWidget()
+        form = QFormLayout(page)
+        self.total = count(4, 2)
+        form.addRow('Boards in total', self.total)
+        radius = max(size[0], size[1]) * 0.75 + 5.
+        self.center = [spin(center[0] - radius), spin(center[1])]
+        form.addRow('Center X', self.center[0])
+        form.addRow('Center Y', self.center[1])
+        self.angle = spin(360., -360, 360, '°', 15.)
+        form.addRow('Total angle', self.angle)
+        self.follow = QCheckBox('Rotate the boards with the pattern')
+        self.follow.setChecked(True)
+        form.addRow(self.follow)
+        self.pages.addWidget(page)
         note = QLabel('Every copy is a separate board instance (same KiCad file) that you can move on its own.')
         note.setWordWrap(True)
         note.setObjectName('secondary')
-        form.addRow(note)
+        layout.addWidget(note)
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
-        form.addRow(buttons)
-        for widget in [self.count, self.rotate] + self.step:
+        layout.addWidget(buttons)
+        self.kind.currentIndexChanged.connect(self.pages.setCurrentIndex)
+        self.kind.currentIndexChanged.connect(lambda *_: self.previewChanged.emit(self.poses()))
+        boxes = [self.count, self.rotate, self.columns, self.rows, self.levels, self.total, self.angle] + self.step + self.spacing + self.center
+        for widget in boxes:
             widget.valueChanged.connect(lambda *_: self.previewChanged.emit(self.poses()))
+        self.follow.toggled.connect(lambda *_: self.previewChanged.emit(self.poses()))
 
     def poses(self):
+        kind = self.kind.currentText()
+        if kind == 'Grid':
+            return grid_poses(self.pose, self.columns.value(), self.rows.value(), self.levels.value(),
+                              [s.value() for s in self.spacing])
+        if kind == 'Circular':
+            return circular_poses(self.pose, self.total.value(), [c.value() for c in self.center], self.angle.value(),
+                                  self.follow.isChecked())
         return copy_poses(self.pose, self.count.value(), [s.value() for s in self.step], self.rotate.value())

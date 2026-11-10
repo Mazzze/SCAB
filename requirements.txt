@@ -3,5 +3,6 @@ PySide6==6.12.0
 pyqtgraph==0.14.0
 numpy==2.5.3
 PyOpenGL==3.1.10
+mapbox_earcut==2.1.0
 # optional: read .step 3D models of KiCad footprints (OpenCASCADE)
 cascadio==0.1.1  # optional

@@ -54,12 +54,24 @@ Try `examples/parametric_mount.scad` (opened at start-up) and
 
 * One header bar: menus on the left, tools as icons (hover for the name and
   shortcut). Toggles on the right: draft mesh, build while typing, Vim.
-* Model tools: **Inspect** (I), **Dimension handles** (D), **Move** (G),
-  **Rotate** (R), plus color, duplicate, pattern, boolean, thread, measure and
-  section plane. Right-click the model, the object list or the editor for the
-  same operations on the selected object.
+* Model tools: **Inspect** (Esc), **Dimension handles** (D), **Move** (G),
+  **Rotate** (R), plus color, duplicate, pattern, boolean, thread, measure (M)
+  and section plane. The keys work in the 3D view. Right-click the model, the
+  object list or the editor for the same operations on the selected object.
+* **Dragging handles**: the handle under the mouse lights up (bigger, white
+  edge, drawn on top), so it is clear which one you grab where axes cross.
+  Hold **Shift** for fine steps (×0.1) and **Ctrl** to snap — whole mm and 15°
+  steps (Ctrl+Shift: 0.1 mm / 5°); a board snaps to whole positions and angles.
+  Esc while dragging cancels.
+* **Selection**: click empty space to clear it. **Esc** in the 3D view goes
+  back to Inspect, a second Esc clears the selection.
+* **From mouse to keyboard**: after moving something in the 3D view, press
+  **I** to jump to its code (a board's `<name>_pose` line). With Vim on you
+  land in Normal mode, so another **i** starts typing.
+* The divider between Objects and Project can be dragged (it is remembered).
 * Views: Fit (F), Isometric (0), Top (7), Front (1), Right (3), or click the
-  view cube. Left drag orbits, Shift+drag pans, Ctrl+drag rolls, wheel zooms.
+  view cube. Left drag orbits, Shift+drag pans, Ctrl+drag rolls (away from
+  handles), wheel zooms.
 * **Measure**: click two points (on the model or the KiCad board).
 * `File → Save view as PNG`, `File → Open recent`; files changed by another
   program are reloaded automatically when they have no unsaved edits.
@@ -206,9 +218,27 @@ with `<name>_pose = [[x, y, z], [rx, ry, rz]];` and `include <kicad/<name>.scad>
   board body, pads and silkscreen are meshed directly (no CGAL), about a second
   for the example boards.
 * **Duplicate / Pattern a board**: select a board and use the Duplicate or
-  Pattern tool (or right-click it). Each copy is a new board id on the same
-  KiCad file with its own `<id>_pose`, so it can be moved on its own; Pattern
-  shows ghost previews while you set count, step and rotation.
+  Pattern tool (or right-click it). Pattern is linear, grid (columns × rows ×
+  layers) or circular (number of boards, center, total angle, turn the boards
+  or keep their orientation), with ghost previews. Each copy is a new board id
+  on the same KiCad file with its own `<id>_pose`, so it can be moved on its
+  own. Copies share one load of the KiCad file, so they always update together.
+* **Copper layers (traces)**: the *Traces* box in the Boards tab (or the board's
+  right-click menu) shows the tracks, arcs, vias and zone fills of every copper
+  layer, each as a thin plate at its height in the KiCad stackup — use the
+  section plane to look at the inner layers. `View → Load PCB copper layers`
+  turns them on for every board; off (the default), boards load without them
+  and a *Traces* box loads one board's copper on demand. Copper is only drawn
+  in the 3D view; it never goes into the OpenSCAD compile.
+
+  ![Copper on the example board: tracks on top, and the In1.Cu ground plane in a section at 1.3 mm](docs/kicad_copper.png)
+* **Board color**: SCAB uses the solder mask color from the KiCad stackup — in
+  KiCad: *Board Setup → Board Stackup → Physical Stackup*, the *Color* column of
+  F.Mask / B.Mask (silkscreen color likewise). Save in KiCad and SCAB follows.
+  To override it in SCAB only, click the *Color* swatch in the Boards tab or use
+  *Board color…* in the board's menu; it is stored on the link line
+  (`// scab: kicad display = display/display.kicad_pcb color=#c03030`) and only
+  colors the board, not the components.
 * **Right-click menus**: a board in the 3D view, in the Boards tab or under
   *KiCad boards* in the Project tree has the same menu — open in KiCad, reload,
   move/rotate/flip, focus, duplicate, pattern, show/hide board or parts,
@@ -313,6 +343,7 @@ Layout:
 | `scab/diagnostics.py`, `problems.py` | Error parsing / mapping and the Problems panel |
 | `scab/kicad.py` | `.kicad_pcb` / CSV export |
 | `scab/kicad_import.py`, `vrml.py`, `step.py` | KiCad board, silkscreen and 3D model (VRML / STEP) import, generated SCAD include |
+| `scab/kicad_copper.py` | Copper layers, stackup heights and board colors |
 | `scab/kicad_silk.py`, `meshgen.py` | Exact silkscreen via `kicad-cli` SVG, direct NumPy meshes for pads and silkscreen |
 | `scab/export_parts.py` | One STL per chassis object |
 | `scab/boards.py` | Board ids, poses in the source, Boards panel |

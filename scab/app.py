@@ -16,7 +16,7 @@ from .editor import Editor, Diagnostic
 from .diagnostics import parse_log, source_problems, PathMapper, count_text
 from .problems import ProblemsPanel
 from .clearance_panel import ClearancePanel
-from .boards import BoardsPanel, BoardEntry, read_pose, write_pose, add_link, remove_link, pose_from_matrix
+from .boards import BoardsPanel, BoardEntry, read_pose, write_pose, add_link, remove_link, pose_from_matrix, link_option, set_link_option, parse_rgb
 from .inspector_panel import InspectorPanel
 from .inspector import Explainer, apply_edit
 from .trace import trace as trace_design
@@ -185,6 +185,7 @@ class Window(ProjectMixin,QMainWindow):
         self.tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.tree.itemSelectionChanged.connect(self.tree_selected)
         self.viewer.picked.connect(self.viewport_selected)
+        self.viewer.keyCommand.connect(self.viewer_key)
         self.viewer.pickedPoint.connect(self.inspect_point)
         self.viewer.dimensionEdited.connect(self.apply_dimension)
         self.viewer.transformEdited.connect(self.apply_transform)
@@ -197,6 +198,7 @@ class Window(ProjectMixin,QMainWindow):
         self.clearance_panel.checkRequested.connect(self.run_clearance)
         self.clearance_panel.partSelected.connect(self.select_board_part)
         self.boards = {}
+        self.board_jobs = {}
         self.selected_board = None
         self.boards_panel = BoardsPanel()
         self.boards_panel.addRequested.connect(self.load_kicad)
@@ -207,6 +209,8 @@ class Window(ProjectMixin,QMainWindow):
         self.boards_panel.focusRequested.connect(self.focus_board)
         self.boards_panel.poseEdited.connect(self.set_board_pose)
         self.boards_panel.visibilityChanged.connect(self.board_visibility)
+        self.boards_panel.tracesChanged.connect(self.board_traces)
+        self.boards_panel.colorRequested.connect(self.board_color_dialog)
         self.boards_panel.boardSelected.connect(self.select_board)
         self.boards_panel.kicadRequested.connect(lambda ident:self.open_board_in_kicad(ident))
         self.boards_panel.menuRequested.connect(lambda ident,pos:self.board_menu(pos,ident))
@@ -215,7 +219,7 @@ class Window(ProjectMixin,QMainWindow):
         self.board_timer = QTimer(self); self.board_timer.setSingleShot(True); self.board_timer.timeout.connect(self.reload_kicad)
         self.source_watcher = QFileSystemWatcher(self)
         self.source_watcher.fileChanged.connect(self.source_file_changed)
-        self.boardLoaded.connect(self.board_loaded, Qt.QueuedConnection)
+        self.boardLoaded.connect(self.path_loaded, Qt.QueuedConnection)
         self.partsExported.connect(self.parts_exported, Qt.QueuedConnection)
         self.exportProgress.connect(self.info, Qt.QueuedConnection)
         self.viewer.measured.connect(lambda text: self.info(text))
@@ -292,13 +296,14 @@ class Window(ProjectMixin,QMainWindow):
         A('auto','Build while typing',checkable=True).toggled.connect(self.auto.setChecked);self.actions['auto'].setChecked(True)
         A('vim','Vim mode',checkable=True).toggled.connect(self.vim_check.setChecked);self.actions['vim'].setChecked(self.vim_enabled)
         tools=QActionGroup(self);tools.setExclusive(True)
-        for name,text,mode,key,tip in (('inspect','Inspect','Inspect','I','Click the model to see and edit the parameters behind it'),
+        for name,text,mode,key,tip in (('inspect','Inspect','Inspect','Esc','Click the model to see and edit the parameters behind it. In the 3D view: I jumps to the code of the selection'),
                                        ('dimensions','Dimension handles','Dimensions','D','Drag sizes of the selected object'),
                                        ('move','Move','Move','G','Drag the selected object along an axis'),
                                        ('rotate','Rotate','Rotate','R','Rotate the selected object about an axis')):
-            action=A(name,text,checkable=True,tip=tip);tools.addAction(action)
+            action=A(name,text,checkable=True,tip=f'{tip} · key {key} in the 3D view');tools.addAction(action)
             action.triggered.connect(lambda _=False,m=mode:self.object_tool.setCurrentText(m))
         self.actions['inspect'].setChecked(True)
+        self.object_tool.currentTextChanged.connect(self.sync_tool_actions)
         A('color','Color…',self.color,tip='Set the color of the selected object')
         A('duplicate','Duplicate…',self.duplicate,'Ctrl+D')
         A('pattern','Pattern…',self.pattern,tip='Linear, rectangular, circular or helix pattern')
@@ -307,6 +312,11 @@ class Window(ProjectMixin,QMainWindow):
         A('animate','Animate variable…',self.bind_animation)
         A('measure','Measure',checkable=True,tip='Click two points on the model').toggled.connect(self.set_measure)
         A('section','Section plane',checkable=True).toggled.connect(self.toggle_section)
+        self.load_copper=str(self.settings.value('load_copper','false')).lower()=='true'
+        A('load_copper','Load PCB copper layers (traces)',checkable=True,
+          tip='Mesh the tracks, vias and zone fills of every copper layer when a board loads (each board\'s Traces box shows/hides them). Off: boards load faster; a Traces box still loads one board on demand.')
+        self.actions['load_copper'].setChecked(self.load_copper)
+        self.actions['load_copper'].toggled.connect(self.set_load_copper)
         A('kicad_import','Add KiCad board…',self.load_kicad,'Ctrl+Shift+L',tip='Add a .kicad_pcb from any project; it updates live when KiCad saves. Several boards can be added and moved.')
         A('export_step','Export STEP (model + all boards)…',self.export_step,'Ctrl+Shift+E',tip='One .step with every SCAD object and every visible KiCad board with its 3D parts')
         A('kicad_export','Export KiCad board…',self.export_kicad,'Ctrl+Shift+K')
@@ -347,7 +357,7 @@ class Window(ProjectMixin,QMainWindow):
         self.file_menu=menu('File',['new','open','save','-','export','export_parts','export_step','camera','-','settings'])
         self.recent_menu=self.file_menu.addMenu('Open recent');self.refresh_recent_menu()
         menu('Edit',['undo','redo','-','find','replace','find_next','find_previous','goto_line','comment','-','vim','auto'])
-        menu('View',['fit','view_iso','view_top','view_front','view_right','-','draft','section','-','camera'])
+        menu('View',['fit','view_iso','view_top','view_front','view_right','-','draft','section','load_copper','-','camera'])
         menu('Model',['inspect','dimensions','move','rotate','-','color','duplicate','pattern','boolean','thread','animate','-','measure','build','stop'])
         menu('PCB',['kicad_import','open_kicad','open_kicad_project','reload','clearance','-','export_parts','export_step','-','kicad','kicad_export'])
         self.project_menu_bar=menus
@@ -365,14 +375,24 @@ class Window(ProjectMixin,QMainWindow):
         self.setMenuWidget(header)
 
         # ---- left: objects + project
-        left=QWidget(); ll=QVBoxLayout(left); ll.setContentsMargins(0,0,0,0); ll.setSpacing(0)
+        objects_box=QWidget(); ll=QVBoxLayout(objects_box); ll.setContentsMargins(0,0,0,0); ll.setSpacing(0)
         objects_title=QLabel('Objects');objects_title.setObjectName('panelTitle');ll.addWidget(objects_title)
         self.file_label=QLabel('');self.file_label.hide()
         ll.addWidget(self.tree,2)
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(lambda pos:self.model_menu(self.tree.viewport().mapToGlobal(pos)))
         middle=QWidget(); ml=QVBoxLayout(middle); ml.setContentsMargins(0,0,0,0); ml.setSpacing(0)
-        self.setup_documents(ll,ml)
+        project_box=QWidget(); pl=QVBoxLayout(project_box); pl.setContentsMargins(0,0,0,0); pl.setSpacing(0)
+        self.setup_documents(pl,ml)
+        # Objects over Project; drag the divider to give the project tree more room
+        left=self.left_split=QSplitter(Qt.Vertical); left.setChildrenCollapsible(False)
+        left.addWidget(objects_box); left.addWidget(project_box)
+        left.setStretchFactor(0,3); left.setStretchFactor(1,2)
+        try:
+            state=self.settings.value('left_split')
+            if state is not None:left.restoreState(state)
+        except (TypeError,ValueError):pass
+        left.splitterMoved.connect(lambda *_:self.settings.setValue('left_split',self.left_split.saveState()))
         self.hint.setObjectName('secondary');ml.addWidget(self.hint)
         # ---- right: viewer over inspector / problems / output
         right=QWidget(); rl=QVBoxLayout(right); rl.setContentsMargins(0,0,0,0); rl.setSpacing(0)
@@ -521,11 +541,49 @@ class Window(ProjectMixin,QMainWindow):
             if not self.view_matches_editor():
                 self.info('Compile the current source before selecting geometry in the view.');return
         self.tree.clearSelection()
-        if start<0: return
+        if self.selected_board is not None:
+            # a click on the model or on empty space ends a board selection
+            self.selected_board=None;self.viewer.select_board(None);self.boards_panel.tree.clearSelection()
+        if start<0:
+            self.node=None;self.viewer.highlight(-1);self.refresh_handles();return
         for i in range(self.tree.topLevelItemCount()):
             item=self.tree.topLevelItem(i)
             if item.data(0,Qt.UserRole).start==start:
                 item.setSelected(True); self.tree.scrollToItem(item); break
+
+    def viewer_key(self,command):
+        """Keys typed in the 3D view: Esc → Inspect (again: clear the selection), I → code, G/R/D tools."""
+        if command=='escape':
+            if self.actions['measure'].isChecked():self.actions['measure'].setChecked(False);return
+            if self.object_tool.currentText()!='Inspect':
+                self.object_tool.setCurrentText('Inspect');self.info('Inspect · click the model to see its parameters');return
+            self.clear_selection();return
+        if command=='source':self.jump_to_source();return
+        if command=='measure':self.actions['measure'].toggle();return
+        if command=='delete':return
+        self.object_tool.setCurrentText(command)
+
+    def clear_selection(self):
+        self.tree.clearSelection();self.node=None
+        self.selected_board=None;self.viewer.select_board(None);self.viewer.highlight(-1)
+        self.boards_panel.tree.clearSelection();self.refresh_handles()
+
+    def jump_to_source(self):
+        """From the 3D view to the code of what is selected (Vim: in Normal mode, so the next i inserts)."""
+        source=self.editor.toPlainText();at=None
+        if self.selected_board:
+            m=re.search(r'^[ \t]*'+re.escape(self.selected_board)+r'_pose\s*=\s*',source,re.M)
+            if m is None:m=re.search(r'^[ \t]*//\s*scab\s*:\s*kicad[ \t]+'+re.escape(self.selected_board)+r'\b',source,re.M)
+            at=m.end() if m else None
+        elif self.node is not None and self.view_matches_editor():
+            at=self.node.start
+        if at is not None:self.editor.select_source(at,at)
+        elif self.editor.vim and self.editor.vim_engine.mode!='NORMAL':self.editor.set_mode('NORMAL')
+        self.editor.setFocus()
+
+    def sync_tool_actions(self,mode):
+        name={'Inspect':'inspect','Dimensions':'dimensions','Move':'move','Rotate':'rotate'}.get(mode)
+        if name in self.actions and not self.actions[name].isChecked():self.actions[name].setChecked(True)
 
     def refresh_handles(self,*_):
         if not hasattr(self,'dimensions_check') or not self.dimensions_check.isChecked() or not self.doc:
@@ -692,6 +750,9 @@ class Window(ProjectMixin,QMainWindow):
     def add_board_copies(self,ident,poses):
         from .boards import add_copies
         source,new=add_copies(self.editor.toPlainText(),ident,self.board_relative_path(ident),poses,self.boards)
+        color=link_option(source,ident,'color')
+        if color:
+            for copy in new:source=set_link_option(source,copy,'color',color)
         self.replace_source(source)
         self.sync_boards()
         self.info(f'Added {", ".join(new)} (copies of board {ident}) · each can be moved on its own')
@@ -713,7 +774,9 @@ class Window(ProjectMixin,QMainWindow):
     def pattern_board(self,ident):
         from .boards import BoardPatternDialog,pose_matrix
         entry=self.boards[ident]
-        dialog=BoardPatternDialog(self,ident,entry.pose,self.board_size(ident))
+        bounds=self.viewer.board_bounds(ident)
+        center=((bounds[0]+bounds[1])/2)[:2] if bounds is not None else None
+        dialog=BoardPatternDialog(self,ident,entry.pose,self.board_size(ident),center)
         preview=lambda poses:self.viewer.preview_board_copies(ident,[pose_matrix(*p) for p in poses])
         dialog.previewChanged.connect(preview);preview(dialog.poses())
         accepted=dialog.exec()
@@ -846,7 +909,7 @@ class Window(ProjectMixin,QMainWindow):
     def open_board(self,path,ident='kicad'):
         entry=self.boards.get(ident)
         if entry is None:
-            entry=self.boards[ident]=BoardEntry(ident,Path(path).resolve())
+            entry=self.boards[ident]=BoardEntry(ident,Path(path).resolve(),show_traces=self.load_copper)
         entry.path=Path(path).resolve()
         if str(entry.path) not in self.board_watcher.files():self.board_watcher.addPath(str(entry.path))
         self.reload_board(ident)
@@ -868,41 +931,61 @@ class Window(ProjectMixin,QMainWindow):
         for ident in list(self.boards):self.reload_board(ident)
 
     def reload_board(self,ident):
+        """(Re)load a board. Copies of the same KiCad file share one load (and one kicad-cli export)."""
         entry=self.boards.get(ident)
         if entry is None:return
-        if entry.loading:
-            entry.reload_again=True;return
         entry.loading=True;entry.error=''
         self.update_board_progress()
-        path=entry.path;executable=self.executable
-        cache=(self.project_root or (self.path.parent if self.path else path.parent))/'.scab-cache'
         self.boards_panel.set_boards(list(self.boards.values()))
+        path=entry.path;key=str(path)
+        try:stamp=path.stat().st_mtime_ns,path.stat().st_size
+        except OSError:stamp=None
+        job=self.board_jobs.get(key)
+        if job is not None:
+            job['idents'].add(ident)
+            if stamp!=job['stamp']:job['again']=True       # changed again while loading
+            if entry.show_traces and not job.get('copper'):job['again']=True
+            return
+        copper=self.load_copper or any(e.show_traces for e in self.boards.values() if e.path==path)
+        self.board_jobs[key]={'idents':{ident},'stamp':stamp,'again':False,'copper':copper}
+        executable=self.executable
+        cache=(self.project_root or (self.path.parent if self.path else path.parent))/'.scab-cache'
         def work():
             from .kicad_import import load_board
             # 1) fast: parse + 3D parts -> include and SCAD rebuild right after the save
             try:quick=load_board(path,executable,cache,meshes=False)
             except (OSError,ValueError,RuntimeError) as exc:
-                self.boardLoaded.emit(ident,None,str(exc));return
-            self.boardLoaded.emit(ident,quick,None)
-            # 2) complete: OpenSCAD meshes for the board body, pads and silkscreen
-            try:result,error=load_board(path,executable,cache),None
+                self.boardLoaded.emit(key,None,str(exc));return
+            self.boardLoaded.emit(key,quick,None)
+            # 2) complete: meshes for the board body, pads and silkscreen
+            try:result,error=load_board(path,executable,cache,copper=copper),None
             except (OSError,ValueError,RuntimeError) as exc:result,error=None,str(exc)
-            self.boardLoaded.emit(ident,result,error)
+            self.boardLoaded.emit(key,result,error)
         threading.Thread(target=work,daemon=True,name='kicad').start()
+
+    def path_loaded(self,key,model,error):
+        """A load of one KiCad file finished (partially or completely): hand it to every board using it."""
+        job=self.board_jobs.get(key)
+        if job is None:return
+        partial=model is not None and getattr(model,'partial',False)
+        if not partial:self.board_jobs.pop(key,None)
+        if not partial and job['again']:
+            for ident in job['idents']:self.reload_board(ident)
+            return
+        for ident in sorted(job['idents']):
+            entry=self.boards.get(ident)
+            if entry is not None and str(entry.path)==key:self.board_loaded(ident,model,error)
 
     def board_loaded(self,ident,model,error):
         entry=self.boards.get(ident)
         if entry is None:return
         partial=model is not None and getattr(model,'partial',False)
-        if partial and entry.model is not None:
+        if partial and entry.model is not None and entry.model.body is not None and model.body is None:
             # keep showing the previous board body until the new meshes arrive
             model.body,model.pads,model.silk=entry.model.body,entry.model.pads,entry.model.silk
-        elif partial:
-            model.notes=[n for n in model.notes]
+            model.copper=entry.model.copper
         entry.loading=partial
         self.update_board_progress();self.project_tree_later()
-        if not partial and getattr(entry,'reload_again',False):
-            entry.reload_again=False;self.reload_board(ident);return
         if model is None:
             entry.error=f'failed: {error}';self.boards_panel.set_boards(list(self.boards.values()))
             self.error(f'KiCad board {ident}: {error}');return
@@ -937,7 +1020,7 @@ class Window(ProjectMixin,QMainWindow):
         boards=[]
         for entry in self.boards.values():
             if entry.model is None:continue
-            boards.append((entry.ident,entry.model.reference_parts(),entry.matrix,entry.visible,entry.show_parts,entry.model.part_offset))
+            boards.append((entry.ident,entry.model.reference_parts(entry.color,entry.show_traces),entry.matrix,entry.visible,entry.show_parts,entry.model.part_offset))
         self.viewer.set_boards(boards)
         if self.selected_board and self.object_tool.currentText() in ('Move','Rotate'):
             self.viewer.set_board_gizmo(self.object_tool.currentText(),self.selected_board)
@@ -951,18 +1034,23 @@ class Window(ProjectMixin,QMainWindow):
             entry=self.boards.pop(ident)
             if str(entry.path) in self.board_watcher.files() and not any(e.path==entry.path for e in self.boards.values()):
                 self.board_watcher.removePath(str(entry.path))
-        moved=False
+        moved=recolor=False
         for ident,path in links.items():
             pose=read_pose(source,ident) or ([0.,0.,0.],[0.,0.,0.])
             entry=self.boards.get(ident)
             if entry is None or entry.path!=path:
-                self.boards[ident]=BoardEntry(ident,path,pose=pose)
+                entry=self.boards[ident]=BoardEntry(ident,path,pose=pose,show_traces=self.load_copper,color=parse_rgb(link_option(source,ident,'color')))
                 twin=next((e for e in self.boards.values() if e.ident!=ident and e.path==path and e.model is not None and not e.loading),None)
                 if twin is not None:
                     if str(path) not in self.board_watcher.files():self.board_watcher.addPath(str(path))
                     self.board_loaded(ident,twin.model,None)
                 else:
                     self.open_board(path,ident)
+            elif entry.color!=parse_rgb(link_option(source,ident,'color')):
+                entry.color=parse_rgb(link_option(source,ident,'color'));recolor=True
+                if [list(entry.pose[0]),list(entry.pose[1])]!=[list(pose[0]),list(pose[1])]:
+                    entry.pose=pose;moved=True
+                    self.viewer.set_board_pose(ident,entry.matrix)
             elif [list(entry.pose[0]),list(entry.pose[1])]!=[list(pose[0]),list(pose[1])]:
                 entry.pose=pose;moved=True
                 self.viewer.set_board_pose(ident,entry.matrix)
@@ -970,6 +1058,7 @@ class Window(ProjectMixin,QMainWindow):
             self.viewer.set_board_gizmo(self.object_tool.currentText(),self.selected_board)
         if links or self.viewer.reference_items:
             if not links:self.viewer.set_boards([])
+        if recolor:self.update_board_view()
         self.boards_panel.set_boards(list(self.boards.values()))
         self.project_tree_later()
         if moved:self.clearance_timer_start()
@@ -1028,6 +1117,36 @@ class Window(ProjectMixin,QMainWindow):
         if entry is None:return
         entry.visible,entry.show_parts=visible,parts
         self.update_board_view();self.project_tree_later()
+
+    def board_traces(self,ident,on):
+        """Show / hide a board's copper layers; loads them on first use."""
+        entry=self.boards.get(ident)
+        if entry is None:return
+        for other in self.boards.values():
+            if other.path==entry.path:other.show_traces=on   # copies share the file and its meshes
+        if on and entry.model is not None and not getattr(entry.model,'has_copper',False):
+            self.info(f'Loading the copper layers of {entry.path.name}…');self.reload_board(ident)
+        self.update_board_view();self.boards_panel.set_boards(list(self.boards.values()))
+
+    def set_load_copper(self,on):
+        self.load_copper=bool(on);self.settings.setValue('load_copper','true' if on else 'false')
+        for entry in self.boards.values():
+            if entry.show_traces!=on:self.board_traces(entry.ident,on)
+
+    def board_color_dialog(self,ident):
+        from PySide6.QtWidgets import QColorDialog
+        entry=self.boards.get(ident)
+        if entry is None:return
+        current=entry.color or (entry.model.colors()[0][:3] if entry.model is not None else (.1,.4,.2))
+        color=QColorDialog.getColor(QColor.fromRgbF(*map(float,current[:3])),self,f'Board color · {ident}')
+        if color.isValid():self.set_board_color(ident,color.name())
+
+    def set_board_color(self,ident,value):
+        """value '#rrggbb' or None (KiCad stackup color); kept on the board's link line in the source."""
+        source=self.editor.toPlainText()
+        updated=set_link_option(source,ident,'color',value)
+        if updated!=source:self.replace_source(updated)
+        self.sync_boards()
 
     def select_board(self,ident):
         self.selected_board=ident
@@ -1285,6 +1404,10 @@ class Window(ProjectMixin,QMainWindow):
         show.toggled.connect(lambda on:self.set_board_shown(ident,on,entry.show_parts))
         parts=menu.addAction('Show components');parts.setCheckable(True);parts.setChecked(entry.show_parts)
         parts.toggled.connect(lambda on:self.set_board_shown(ident,entry.visible,on))
+        traces=menu.addAction('Show copper layers (traces)');traces.setCheckable(True);traces.setChecked(entry.show_traces)
+        traces.toggled.connect(lambda on:self.board_traces(ident,on))
+        menu.addAction(icon('color'),'Board color…',lambda:self.board_color_dialog(ident))
+        reset=menu.addAction('Use KiCad board color',lambda:self.set_board_color(ident,None));reset.setEnabled(entry.color is not None)
         menu.addSeparator()
         menu.addAction('Rename board…',lambda:self.rename_board(ident))
         menu.addAction('Copy board path',lambda:QApplication.clipboard().setText(str(entry.path)))
@@ -1911,7 +2034,9 @@ class Window(ProjectMixin,QMainWindow):
             'include <kicad/board.scad> gives the outline, holes and part positions; the Clearance tab lists parts that collide or are too close.\n'
             'EDITING (Vim off or Insert mode): Ctrl+F find, Ctrl+H replace, F3 next, Ctrl+G go to line, Ctrl+/ comment, Alt+Up/Down move line, Ctrl+D duplicate.\n'
             'BOARDS: right-click a board → Open in KiCad; saving in KiCad updates the board and the SCAD model.\n'
-            'TOOLS: header icons or right-click the model / object list / editor. I inspect, D dimensions, G move, R rotate, F fit, 0/7/1/3 views. Measure: click two points.\n'
+            'TOOLS: header icons or right-click the model / object list / editor. In the 3D view: Esc inspect (again: clear selection), D dimensions, G move, R rotate, M measure, I jump to the code of the selection (Vim: then i to type). F fit, 0/7/1/3 views.\n'
+            'DRAGGING: the handle under the mouse lights up. Shift = fine, Ctrl = snap to whole mm / 15°, Esc cancels. Click empty space to deselect.\n'
+            'BOARDS: Traces box = copper layers (View → Load PCB copper layers for all); Color swatch = board color (default: KiCad stackup mask color). Pattern: linear, grid or circular.\n'
             'PROBLEMS: syntax errors are shown while typing; OpenSCAD errors and warnings after compiling — red/yellow markers in the gutter, wavy underline, hover for the message, click in Problems or :cn to jump.\n\n'
             'Touchpad: left drag = orbit; Shift+left drag = pan; two-finger scroll/pinch = zoom. Middle/right navigation also supported.\n'
             'Object tool: Dimensions / Move / Rotate. Drag colored axes; release commits SCAD. Ctrl+left drag rolls camera. Panel arrows and cube minus minimize.\n'
