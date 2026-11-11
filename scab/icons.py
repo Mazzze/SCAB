@@ -11,6 +11,9 @@ ACCENT = '#5c8ff2'
 PATHS = {
     'new': '<path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4"/><path d="M12 11v6M9 14h6"/>',
     'open': '<path d="M3 6h6l2 2h10v11H3z"/><path d="M3 10h18"/>',
+    'open_recent': '<path d="M3 6h6l2 2h4"/><path d="M3 6v13h8"/><circle cx="16.5" cy="15.5" r="5"/><path d="M16.5 13v2.7l1.8 1.3"/>',
+    'folder': '<path d="M3 6h6l2 2h10v11H3z"/>',
+    'file': '<path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4"/>',
     'save': '<path d="M4 4h13l3 3v13H4z"/><path d="M8 4v5h8V4"/><path d="M7 20v-6h10v6"/>',
     'undo': '<path d="M9 7 4 12l5 5"/><path d="M4 12h11a5 5 0 0 1 0 10h-3"/>',
     'redo': '<path d="m15 7 5 5-5 5"/><path d="M20 12H9a5 5 0 0 0 0 10h3"/>',
@@ -30,6 +33,7 @@ PATHS = {
     'color': '<path d="M12 3c4 5 6 8 6 11a6 6 0 0 1-12 0c0-3 2-6 6-11z"/>',
     'duplicate': '<rect x="8" y="8" width="12" height="12"/><path d="M16 8V4H4v12h4"/>',
     'pattern': '<rect x="4" y="4" width="4" height="4"/><rect x="10" y="4" width="4" height="4"/><rect x="16" y="4" width="4" height="4"/><rect x="4" y="10" width="4" height="4"/><rect x="10" y="10" width="4" height="4"/><rect x="16" y="10" width="4" height="4"/><rect x="4" y="16" width="4" height="4"/><rect x="10" y="16" width="4" height="4"/><rect x="16" y="16" width="4" height="4"/>',
+    'group': '<rect x="3" y="3" width="18" height="18" stroke-dasharray="3 2"/><rect x="6" y="11" width="6" height="7"/><circle cx="15.5" cy="9" r="3"/>',
     'boolean': '<circle cx="9" cy="12" r="6"/><circle cx="15" cy="12" r="6"/>',
     'animate': '<circle cx="12" cy="13" r="8"/><path d="M12 9v4l3 2M9 2h6"/>',
     'thread': '<path d="M9 3h6v4H9z"/><path d="M8 9l8 2M8 12l8 2M8 15l8 2M8 18l8 2"/><path d="M9 7v14M15 7v14"/>',

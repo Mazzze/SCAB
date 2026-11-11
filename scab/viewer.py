@@ -224,6 +224,7 @@ class Viewer(gl.GLViewWidget):
     boardTransformed=Signal(str,object)
     measured=Signal(str)
     keyCommand=Signal(str)
+    pickedAdd=Signal(int,object)
     def __init__(self):
         super().__init__()
         self.setBackgroundColor('#2a2c30')
@@ -240,7 +241,7 @@ class Viewer(gl.GLViewWidget):
         self.contourReady.connect(self.show_contour, Qt.QueuedConnection)
         self.handles=[]; self.drag_kind=None; self.drag_index=-1; self.drag_value=0.
         self.roll=0.;self.transform_mode='Dimensions';self.gizmo_center=None;self.gizmo_radius=10.
-        self.gizmo_axis=0;self.gizmo_selected=-1;self.ghosts=[]
+        self.gizmo_axis=0;self.gizmo_selected=-1;self.ghosts=[];self.gizmo_starts=set()
         self.pick_items=[]
         self.measure_mode=False;self.measure_points=[]
         self.reference=[];self.reference_items=[];self.reference_data=[];self.reference_owner=[];self.board_items={};self.board_local={};self.board_matrix={};self.gizmo_board=None
@@ -453,12 +454,27 @@ class Viewer(gl.GLViewWidget):
             self.drag_kind=None;self.press_pos=None
         self.gizmo_board=None
         self.transform_mode=mode;self.gizmo_selected=start if start is not None else -1
+        self.gizmo_starts={start} if start is not None else set()
         data=next((s for s in self.scene if s[0]==start),None)
         if data is not None:
             low,high=data[2].min(axis=0),data[2].max(axis=0)
             self.gizmo_center=(low+high)/2;self.gizmo_radius=max(5.,float(np.linalg.norm(high-low))*.42)
         else:self.gizmo_center=None
         self.update()
+
+    def set_gizmo_targets(self,mode,starts,boxes):
+        """Gizmo for parts / groups: whole objects in `starts` move with the drag, `boxes` (world) are outlined."""
+        if self.drag_kind in ('translate','rotate'):
+            self.drag_kind=None;self.press_pos=None
+        self.gizmo_board=None;self.transform_mode=mode;self.gizmo_selected=-1;self.gizmo_starts=set(starts)
+        self.show_pick_boxes(boxes)
+        lows=[np.asarray(b[0],dtype=float) for b in boxes]+[s[2].min(axis=0) for s in self.scene if s[0] in self.gizmo_starts]
+        highs=[np.asarray(b[1],dtype=float) for b in boxes]+[s[2].max(axis=0) for s in self.scene if s[0] in self.gizmo_starts]
+        if lows and mode in ('Move','Rotate'):
+            low,high=np.min(lows,axis=0),np.max(highs,axis=0)
+            self.gizmo_center=(low+high)/2;self.gizmo_radius=max(5.,float(np.linalg.norm(high-low))*.42)
+        else:self.gizmo_center=None
+        self.overlay.update();self.update()
 
     def gizmo_points(self,axis):
         if self.gizmo_center is None:return np.empty((0,3))
@@ -479,7 +495,8 @@ class Viewer(gl.GLViewWidget):
             self.set_board_pose(self.gizmo_board,matrix@base,preview=True);return
         qt=QMatrix4x4(*map(float,matrix.flatten()))
         for item,data in zip(self.meshes,self.scene):
-            if data[0]==self.gizmo_selected:item.setTransform(qt)
+            if data[0]==self.gizmo_selected or data[0] in self.gizmo_starts:item.setTransform(qt)
+        for item in self.pick_items:item.setTransform(qt)
         self.update()
 
     def preview_board_copies(self,ident,matrices):
@@ -703,7 +720,7 @@ class Viewer(gl.GLViewWidget):
             self.dimensionEdited.emit(self.handles[self.drag_index],self.drag_value)
         elif not self.drag_kind and e.button()==Qt.LeftButton and not self.moved:
             if self.measure_mode:self.measure_click(e.position())
-            else:self.pick(e.position())
+            else:self.pick(e.position(),additive=bool(e.modifiers()&Qt.ControlModifier))
         elif e.button()==Qt.RightButton and not self.moved and not self.drag_kind:
             self.contextRequested.emit(e.globalPosition().toPoint(),e.position())
         self.press_pos=None; self.drag_kind=None; self.drag_index=-1; self.overlay.update()
@@ -722,6 +739,13 @@ class Viewer(gl.GLViewWidget):
         e.accept()
 
     def event(self,e):
+        if e.type()==QEvent.KeyPress and e.key()==Qt.Key_Tab and not e.modifiers()&(Qt.ControlModifier|Qt.AltModifier):
+            self.keyCommand.emit('cycle');return True
+        if e.type() in (QEvent.ShortcutOverride,QEvent.KeyPress) and e.key()==Qt.Key_G and e.modifiers()&Qt.ControlModifier:
+            # Ctrl+G groups in the 3D view (in the editor it stays "go to line")
+            e.accept()
+            if e.type()==QEvent.KeyPress:self.keyCommand.emit('group')
+            return True
         if e.type()==QEvent.NativeGesture:
             if e.gestureType()==Qt.NativeGestureType.ZoomNativeGesture:
                 self.opts['distance']=float(np.clip(self.opts['distance']*math.exp(-e.value()*3),.05,1e8)); self.update(); return True
@@ -732,7 +756,7 @@ class Viewer(gl.GLViewWidget):
     def mouseDoubleClickEvent(self,e):
         if not self.drag_kind: self.fit()
 
-    def pick(self,pos):
+    def pick(self,pos,additive=False):
         rect=(0,0,self.width(),self.height())
         inverse,ok=(self.projectionMatrix(rect,rect)*self.viewMatrix()).inverted()
         if not ok: return
@@ -751,6 +775,9 @@ class Viewer(gl.GLViewWidget):
             if dist<board[0]:board=(dist,owner)
         if board[1] is not None and board[0]<best:
             self.boardPicked.emit(board[1][0],board[1][1],origin+direction*board[0]);return
+        if additive:
+            if selected>=0:self.pickedAdd.emit(selected,origin+direction*best)
+            return
         self.picked.emit(selected)
         self.pickedPoint.emit(selected,(origin+direction*best) if np.isfinite(best) else None)
 
@@ -859,9 +886,15 @@ class Viewer(gl.GLViewWidget):
         else:self.gizmo_center=None
         self.update()
 
-    def show_pick_box(self,low,high,cutter=False):
-        """Outline the inspected primitive (world-space box)."""
+    def show_pick_boxes(self,boxes,cutter=False):
+        """Outline several world boxes (selected parts)."""
         self.clear_pick_box()
+        for low,high in boxes:self.show_pick_box(low,high,cutter,keep=True)
+
+    def show_pick_box(self,low,high,cutter=False,keep=False):
+        """Outline the inspected primitive (world-space box)."""
+        if not keep:self.clear_pick_box()
+        previous=list(self.pick_items) if keep else []
         low,high=np.asarray(low,dtype=float),np.asarray(high,dtype=float)
         pad=max(.05,float(np.max(high-low))*.01)
         low,high=low-pad,high+pad
@@ -870,7 +903,7 @@ class Viewer(gl.GLViewWidget):
         color=(1.,.45,.35,1.) if cutter else (1.,.85,.25,1.)
         item=gl.GLLinePlotItem(pos=np.array([corners[k] for pair in edges for k in pair],dtype=np.float32),mode='lines',color=color,width=2,antialias=True)
         item.setGLOptions('additive')
-        self.addItem(item);self.pick_items=[item];self.update()
+        self.addItem(item);self.pick_items=previous+[item];self.update()
 
     def clear_pick_box(self):
         for item in self.pick_items:self.removeItem(item)

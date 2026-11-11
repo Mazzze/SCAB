@@ -63,6 +63,29 @@ Try `examples/parametric_mount.scad` (opened at start-up) and
   Hold **Shift** for fine steps (×0.1) and **Ctrl** to snap — whole mm and 15°
   steps (Ctrl+Shift: 0.1 mm / 5°); a board snaps to whole positions and angles.
   Esc while dragging cancels.
+* **Move / Rotate parts and groups**: with Move (G) or Rotate (R) a click
+  selects the *part* under the mouse — even deep inside a `translate() { … }`
+  or a module call. A bar at the top of the 3D view lists what that click can
+  move: **Part**, the **Group** around it (the `translate` / block it shares
+  with other parts), a **group variable** it belongs to, or the **Whole object**
+  (Tab cycles). Moving a part edits its own literal `translate([...])` or adds
+  one; drags along world axes stay world axes inside rotated groups.
+* **Grouping**: Ctrl+click more parts (Ctrl+click again removes one), or
+  Ctrl+click rows in the object list. Dragging several parts groups them:
+  neighbours in the text get one `translate(<name>) { … }`, parts spread over
+  the file each get `translate(<name>)` with the same variable — so they move
+  together from then on. The name is made from what you grouped: the comment
+  above a part (`// Lid` → `lid`), the module it calls, the list a `for` loops
+  over, or the primitive, e.g. `lid_and_standoffs_pos`:
+
+  ```openscad
+  lid_and_standoffs_pos = [0, 0, 3];   // SCAB group: moves lid, standoffs together
+  ```
+
+  **Group…** (Ctrl+G in the 3D view, or Model → Group parts) asks for the name
+  first. Selecting a member offers *Group lid_and_standoffs_pos*; the bar then
+  has **Rename…** and **Ungroup** (the offset becomes a plain `translate` on
+  each part).
 * **Selection**: click empty space to clear it. **Esc** in the 3D view goes
   back to Inspect, a second Esc clears the selection.
 * **From mouse to keyboard**: after moving something in the 3D view, press
@@ -73,8 +96,15 @@ Try `examples/parametric_mount.scad` (opened at start-up) and
   view cube. Left drag orbits, Shift+drag pans, Ctrl+drag rolls (away from
   handles), wheel zooms.
 * **Measure**: click two points (on the model or the KiCad board).
-* `File → Save view as PNG`, `File → Open recent`; files changed by another
-  program are reloaded automatically when they have no unsaved edits.
+* **Project panel**: the box at its top switches between the current project
+  and recent project folders and files (unmodified tabs of the previous project
+  close; edited ones stay). Next to it: **Open recent** (also in the header bar
+  and `File → Open recent`), open project folder, new module file and refresh.
+  The filter finds files, variables, modules and boards. The tree lists the
+  project's files with their variables and modules, the KiCad boards and a
+  **Recent** section (double-click to switch, right-click to remove).
+* `File → Save view as PNG`; files changed by another program are reloaded
+  automatically when they have no unsaved edits.
 
 ## The Inspector
 
@@ -343,6 +373,7 @@ Layout:
 | `scab/diagnostics.py`, `problems.py` | Error parsing / mapping and the Problems panel |
 | `scab/kicad.py` | `.kicad_pcb` / CSV export |
 | `scab/kicad_import.py`, `vrml.py`, `step.py` | KiCad board, silkscreen and 3D model (VRML / STEP) import, generated SCAD include |
+| `scab/grouping.py`, `move_tool.py` | Moving parts inside groups, grouping with a shared position variable |
 | `scab/kicad_copper.py` | Copper layers, stackup heights and board colors |
 | `scab/kicad_silk.py`, `meshgen.py` | Exact silkscreen via `kicad-cli` SVG, direct NumPy meshes for pads and silkscreen |
 | `scab/export_parts.py` | One STL per chassis object |
