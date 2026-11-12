@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
     QLabel, QPushButton, QSplitter, QTreeWidget, QTreeWidgetItem, QPlainTextEdit,
     QFileDialog, QMessageBox, QInputDialog, QColorDialog, QCheckBox, QComboBox,
     QDoubleSpinBox, QSpinBox, QSlider, QDialog, QFormLayout, QDialogButtonBox,
-    QGroupBox, QAbstractItemView, QProgressBar, QTabWidget, QMenuBar, QToolBar, QMenu)
+    QGroupBox, QAbstractItemView, QProgressBar, QTabWidget, QMenuBar, QToolBar, QMenu, QToolButton)
 from .model import Document, SourceError
 from .editor import Editor, Diagnostic
 from .diagnostics import parse_log, source_problems, PathMapper, count_text
@@ -22,6 +22,7 @@ from .inspector import Explainer, apply_edit
 from .trace import trace as trace_design
 from . import __version__
 from .icons import icon
+from .move_tool import MoveMixin
 from .compiler import CompileJob, find_openscad
 from .viewer import Viewer
 from .parameters import handles_for
@@ -143,7 +144,7 @@ def form_dialog(parent, title, fields):
             for k,w in widgets.items()}
 
 
-class Window(ProjectMixin,QMainWindow):
+class Window(ProjectMixin,MoveMixin,QMainWindow):
     traceReady=Signal(object,object)
     partsExported=Signal(object,object)
     exportProgress=Signal(str)
@@ -306,6 +307,7 @@ class Window(ProjectMixin,QMainWindow):
         self.object_tool.currentTextChanged.connect(self.sync_tool_actions)
         A('color','Color…',self.color,tip='Set the color of the selected object')
         A('duplicate','Duplicate…',self.duplicate,'Ctrl+D')
+        A('group','Group parts…',self.group_selection,tip='Group the selected parts under one position variable (Move tool: click a part, Ctrl+click more) · Ctrl+G in the 3D view')
         A('pattern','Pattern…',self.pattern,tip='Linear, rectangular, circular or helix pattern')
         A('boolean','Boolean…',self.boolean,tip='Combine objects selected in the tree (Ctrl+click)')
         A('thread','Metric thread…',self.add_thread)
@@ -355,18 +357,22 @@ class Window(ProjectMixin,QMainWindow):
                 else:m.addAction(self.actions[name])
             return m
         self.file_menu=menu('File',['new','open','save','-','export','export_parts','export_step','camera','-','settings'])
-        self.recent_menu=self.file_menu.addMenu('Open recent');self.refresh_recent_menu()
+        self.recent_menu=QMenu('Open recent',self);self.file_menu.insertMenu(self.file_menu.actions()[2],self.recent_menu)
+        self.recent_menu.setIcon(icon('open_recent'))
         menu('Edit',['undo','redo','-','find','replace','find_next','find_previous','goto_line','comment','-','vim','auto'])
         menu('View',['fit','view_iso','view_top','view_front','view_right','-','draft','section','load_copper','-','camera'])
-        menu('Model',['inspect','dimensions','move','rotate','-','color','duplicate','pattern','boolean','thread','animate','-','measure','build','stop'])
+        menu('Model',['inspect','dimensions','move','rotate','-','group','color','duplicate','pattern','boolean','thread','animate','-','measure','build','stop'])
         menu('PCB',['kicad_import','open_kicad','open_kicad_project','reload','clearance','-','export_parts','export_step','-','kicad','kicad_export'])
         self.project_menu_bar=menus
         self.help_menu=menu('Help',['help'])
         bar=QToolBar();bar.setIconSize(QSize(18,18));bar.setToolButtonStyle(Qt.ToolButtonIconOnly)
-        for name in ['new','open','save','|','undo','redo','|','build','stop','export','|','inspect','dimensions','move','rotate','|',
+        for name in ['new','open','open_recent','save','|','undo','redo','|','build','stop','export','|','inspect','dimensions','move','rotate','|',
                      'color','duplicate','pattern','boolean','thread','|','measure','section','|','kicad_import','clearance','export_step','kicad_export',
                      '|','fit','view_iso','view_top','view_front','view_right']:
             if name=='|':bar.addSeparator()
+            elif name=='open_recent':
+                recent=QToolButton();recent.setIcon(icon('open_recent'));recent.setToolTip('Open recent project or file')
+                recent.setMenu(self.recent_menu);recent.setPopupMode(QToolButton.InstantPopup);bar.addWidget(recent)
             else:bar.addAction(self.actions[name])
         row.addWidget(bar,1)
         toggles=QToolBar();toggles.setIconSize(QSize(18,18))
@@ -384,6 +390,7 @@ class Window(ProjectMixin,QMainWindow):
         middle=QWidget(); ml=QVBoxLayout(middle); ml.setContentsMargins(0,0,0,0); ml.setSpacing(0)
         project_box=QWidget(); pl=QVBoxLayout(project_box); pl.setContentsMargins(0,0,0,0); pl.setSpacing(0)
         self.setup_documents(pl,ml)
+        self.setup_move_tool()
         # Objects over Project; drag the divider to give the project tree more room
         left=self.left_split=QSplitter(Qt.Vertical); left.setChildrenCollapsible(False)
         left.addWidget(objects_box); left.addWidget(project_box)
@@ -526,6 +533,8 @@ class Window(ProjectMixin,QMainWindow):
         self.viewer.select_board(None)
         items=self.tree.selectedItems()
         self.node=items[0].data(0,Qt.UserRole) if items else None
+        if self.move_mode() and not getattr(self,'viewport_picking',False) and hasattr(self,'move_chooser'):
+            self.targets_from_tree([i.data(0,Qt.UserRole) for i in items])
         if self.node:
             self.editor.select_source(self.node.start,self.node.end)
             root=next((r for r in self.doc.roots if r.start<=self.node.start and self.node.end<=r.end),None)
@@ -546,10 +555,13 @@ class Window(ProjectMixin,QMainWindow):
             self.selected_board=None;self.viewer.select_board(None);self.boards_panel.tree.clearSelection()
         if start<0:
             self.node=None;self.viewer.highlight(-1);self.refresh_handles();return
-        for i in range(self.tree.topLevelItemCount()):
-            item=self.tree.topLevelItem(i)
-            if item.data(0,Qt.UserRole).start==start:
-                item.setSelected(True); self.tree.scrollToItem(item); break
+        self.viewport_picking=True
+        try:
+            for i in range(self.tree.topLevelItemCount()):
+                item=self.tree.topLevelItem(i)
+                if item.data(0,Qt.UserRole).start==start:
+                    item.setSelected(True); self.tree.scrollToItem(item); break
+        finally:self.viewport_picking=False
 
     def viewer_key(self,command):
         """Keys typed in the 3D view: Esc → Inspect (again: clear the selection), I → code, G/R/D tools."""
@@ -559,11 +571,14 @@ class Window(ProjectMixin,QMainWindow):
                 self.object_tool.setCurrentText('Inspect');self.info('Inspect · click the model to see its parameters');return
             self.clear_selection();return
         if command=='source':self.jump_to_source();return
+        if command=='cycle':self.cycle_move_option();return
+        if command=='group':self.group_selection();return
         if command=='measure':self.actions['measure'].toggle();return
         if command=='delete':return
         self.object_tool.setCurrentText(command)
 
     def clear_selection(self):
+        self.clear_move_targets()
         self.tree.clearSelection();self.node=None
         self.selected_board=None;self.viewer.select_board(None);self.viewer.highlight(-1)
         self.boards_panel.tree.clearSelection();self.refresh_handles()
@@ -592,6 +607,11 @@ class Window(ProjectMixin,QMainWindow):
         if not self.view_matches_editor():
             self.viewer.set_handles([]); return
         mode=self.object_tool.currentText() if hasattr(self,'object_tool') else 'Dimensions'
+        if hasattr(self,'move_chooser'):
+            if mode in ('Move','Rotate') and self.move_targets and self.move_source==self.doc.source:
+                self.show_move_targets();return
+            if self.move_targets or self.move_chooser.isVisible():
+                self.move_targets,self.move_options=[],[];self.move_chooser.hide();self.viewer.clear_pick_box()
         root=next((r for r in self.doc.roots if self.node and r.start<=self.node.start and self.node.end<=r.end),None)
         if root is None and getattr(self,'selected_board',None) in getattr(self,'boards',{}) and mode in ('Move','Rotate'):
             self.viewer.set_handles([]);self.viewer.set_board_gizmo(mode,self.selected_board);return
@@ -662,6 +682,7 @@ class Window(ProjectMixin,QMainWindow):
 
     def apply_transform(self,kind,axis,amount,pivot):
         if not self.view_matches_editor():return
+        if self.apply_target_transform(kind,axis,amount,pivot):return
         root=next((r for r in self.doc.roots if r.start==self.viewer.gizmo_selected),None)
         if root is None:return
         index=self.doc.roots.index(root)
@@ -1447,19 +1468,53 @@ class Window(ProjectMixin,QMainWindow):
         from .kicad_launch import open_in_kicad
         self.info(open_in_kicad(entry.path,project))
 
-    # ---------------------------------------------------------- recent files
+    # ---------------------------------------------------------- recent files / projects
+    def settings_list(self,key):
+        value=self.settings.value(key,[]) or []
+        return [value] if isinstance(value,str) else [str(v) for v in value]
+
     def remember_recent(self,path):
         if path is None:return
-        items=[p for p in (self.settings.value('recent',[]) or []) if p!=str(path)]
-        self.settings.setValue('recent',[str(path)]+items[:9]);self.refresh_recent_menu()
+        items=[p for p in self.settings_list('recent') if p!=str(path)]
+        self.settings.setValue('recent',[str(path)]+items[:14]);self.refresh_recent_menu()
+
+    def remember_project(self,root):
+        if root is None:return
+        items=[p for p in self.settings_list('recent_projects') if p!=str(root)]
+        self.settings.setValue('recent_projects',[str(root)]+items[:14]);self.refresh_recent_menu()
+
+    def recent_entries(self):
+        """[(kind, path)] recent project folders first, then recent files (existing ones only)."""
+        out=[('project',Path(p)) for p in self.settings_list('recent_projects') if Path(p).is_dir()]
+        folders=[p.resolve() for _,p in out]
+        # a file inside a recent project folder is reached through that project
+        out+=[('file',Path(p)) for p in self.settings_list('recent') if Path(p).is_file()
+              and not any(Path(p).resolve().is_relative_to(f) for f in folders)]
+        return out
+
+    def clear_recent(self):
+        self.settings.setValue('recent',[]);self.settings.setValue('recent_projects',[]);self.refresh_recent_menu()
 
     def refresh_recent_menu(self):
         if not hasattr(self,'recent_menu'):return
         self.recent_menu.clear()
-        items=[p for p in (self.settings.value('recent',[]) or []) if Path(p).exists()]
-        for item in items:
-            action=self.recent_menu.addAction(item);action.triggered.connect(lambda _=False,p=item:self.load_file(Path(p)))
-        self.recent_menu.setEnabled(bool(items))
+        entries=self.recent_entries()
+        projects=[p for k,p in entries if k=='project'];files=[p for k,p in entries if k=='file']
+        if projects:
+            self.recent_menu.addSection('Projects')
+            for path in projects[:10]:
+                action=self.recent_menu.addAction(icon('open'),f'{path.name}   —   {path.parent}')
+                action.setToolTip(str(path));action.triggered.connect(lambda _=False,p=path:self.switch_project(p))
+        if files:
+            self.recent_menu.addSection('Files')
+            for path in files[:12]:
+                action=self.recent_menu.addAction(icon('new'),f'{path.name}   —   {path.parent}')
+                action.setToolTip(str(path));action.triggered.connect(lambda _=False,p=path:self.switch_project(p))
+        if entries:
+            self.recent_menu.addSeparator();self.recent_menu.addAction('Clear recent',self.clear_recent)
+        else:
+            empty=self.recent_menu.addAction('No recent projects or files');empty.setEnabled(False)
+        if hasattr(self,'refresh_project_switcher'):self.refresh_project_switcher()
 
     def watch_source(self):
         files=self.source_watcher.files()
@@ -1668,11 +1723,14 @@ class Window(ProjectMixin,QMainWindow):
             self.time_label.setText('0.000')
         self.refresh_handles()
         self.trace_result=None;self.trace_key=None
-        if self.repick_after_compile and self.last_pick:
+        if getattr(self,'pending_reselect',None):
+            self.viewer.clear_pick_box();self.reselect_after_compile()
+        elif self.repick_after_compile and self.last_pick:
             self.repick_after_compile=False
             self.inspect_point(*self.last_pick)
         else:
             self.viewer.clear_pick_box()
+            if self.move_targets:self.clear_move_targets()
             QTimer.singleShot(50,self.request_trace)
         if any(b.model for b in self.boards.values()):QTimer.singleShot(0,self.run_clearance)
         triangles=sum(len(data[3]) for data in frames[0])
@@ -1824,6 +1882,10 @@ class Window(ProjectMixin,QMainWindow):
         if then:then()
 
     def inspect_point(self,start,point):
+        if self.move_mode():
+            if point is None or start<0:self.clear_move_targets();self.refresh_handles()
+            else:self.pick_move_target(start,point)
+            return
         if point is None or start<0:
             self.inspector.clear();self.viewer.clear_pick_box();return
         if self.compiled_source is None:
@@ -2036,6 +2098,8 @@ class Window(ProjectMixin,QMainWindow):
             'BOARDS: right-click a board → Open in KiCad; saving in KiCad updates the board and the SCAD model.\n'
             'TOOLS: header icons or right-click the model / object list / editor. In the 3D view: Esc inspect (again: clear selection), D dimensions, G move, R rotate, M measure, I jump to the code of the selection (Vim: then i to type). F fit, 0/7/1/3 views.\n'
             'DRAGGING: the handle under the mouse lights up. Shift = fine, Ctrl = snap to whole mm / 15°, Esc cancels. Click empty space to deselect.\n'
+            'PARTS: with Move/Rotate a click selects the part under the mouse; the bar at the top chooses Part / Group / Whole object (Tab cycles). Ctrl+click adds parts; moving several groups them under one named position variable (Ctrl+G: group and name it).\n'
+            'PROJECTS: the Project panel box switches between recent projects and files; Open recent is also in the header bar and the File menu.\n'
             'BOARDS: Traces box = copper layers (View → Load PCB copper layers for all); Color swatch = board color (default: KiCad stackup mask color). Pattern: linear, grid or circular.\n'
             'PROBLEMS: syntax errors are shown while typing; OpenSCAD errors and warnings after compiling — red/yellow markers in the gutter, wavy underline, hover for the message, click in Problems or :cn to jump.\n\n'
             'Touchpad: left drag = orbit; Shift+left drag = pan; two-finger scroll/pinch = zoom. Middle/right navigation also supported.\n'

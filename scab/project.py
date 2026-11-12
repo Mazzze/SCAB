@@ -4,7 +4,7 @@ import re
 from pathlib import Path
 from PySide6.QtCore import Qt,QTimer,QObject,QEvent,QUrl
 from PySide6.QtGui import QAction,QTextCursor,QColor,QBrush,QDesktopServices
-from PySide6.QtWidgets import (QApplication,QMenu,QTreeWidget,QTreeWidgetItem,QTabWidget,QFileDialog,QInputDialog,
+from PySide6.QtWidgets import (QApplication,QMenu,QToolButton,QWidget,QTreeWidget,QTreeWidgetItem,QTabWidget,QFileDialog,QInputDialog,
     QMessageBox,QComboBox,QDialog,QVBoxLayout,QHBoxLayout,QLineEdit,QLabel,QDialogButtonBox,QPushButton)
 from .editor import Editor
 from .model import Document,SourceError
@@ -20,8 +20,8 @@ class ProjectMixin:
         self.project_tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.project_tree.customContextMenuRequested.connect(self.project_context_menu)
         self.project_tree.setToolTip('Double-click to open / edit · right-click for actions')
-        project_title=QLabel('Project');project_title.setObjectName('panelTitle')
-        left_layout.addWidget(project_title);left_layout.addWidget(self.project_tree,1)
+        left_layout.addWidget(self.project_header())
+        left_layout.addWidget(self.project_tree,1)
         self.editor_tabs=QTabWidget();self.editor_tabs.setTabsClosable(True);self.editor_tabs.setDocumentMode(True)
         self.editor_tabs.addTab(self.editor,'Untitled.scad')
         self.editor_tabs.currentChanged.connect(self.activate_document)
@@ -45,6 +45,97 @@ class ProjectMixin:
             menu.addAction(action)
         self.project_timer=QTimer(self);self.project_timer.setSingleShot(True);self.project_timer.timeout.connect(self.refresh_project)
         self.project_timer.start(100)
+
+    # ------------------------------------------------------------ panel header
+    def project_header(self):
+        """Project switcher (current + recent projects and files), tool buttons and a filter."""
+        box=QWidget();layout=QVBoxLayout(box);layout.setContentsMargins(0,0,0,0);layout.setSpacing(0)
+        title=QLabel('Project');title.setObjectName('panelTitle');layout.addWidget(title)
+        row=QHBoxLayout();row.setContentsMargins(4,3,4,2);row.setSpacing(2)
+        self.project_switcher=QComboBox();self.project_switcher.setMinimumWidth(80)
+        self.project_switcher.setToolTip('Switch project: recent project folders and files')
+        self.project_switcher.activated.connect(self.project_switcher_chosen)
+        row.addWidget(self.project_switcher,1)
+        def tool(name,tip,fn,menu=None):
+            button=QToolButton();button.setIcon(icon(name));button.setToolTip(tip)
+            if menu is not None:button.setMenu(menu);button.setPopupMode(QToolButton.InstantPopup)
+            else:button.clicked.connect(fn)
+            row.addWidget(button);return button
+        tool('open_recent','Open recent project or file',None,self.recent_menu)
+        tool('open','Open project folder…',lambda:self.open_project())
+        tool('new','New module file in this project…',lambda:self.new_module_file())
+        tool('reload','Refresh the project tree',lambda:self.refresh_project())
+        layout.addLayout(row)
+        self.project_filter=QLineEdit();self.project_filter.setPlaceholderText('Filter files, variables, modules, boards…')
+        self.project_filter.setClearButtonEnabled(True);self.project_filter.textChanged.connect(self.apply_project_filter)
+        filter_row=QHBoxLayout();filter_row.setContentsMargins(4,0,4,3);filter_row.addWidget(self.project_filter)
+        layout.addLayout(filter_row)
+        return box
+
+    def refresh_project_switcher(self):
+        if not hasattr(self,'project_switcher'):return
+        combo=self.project_switcher;combo.blockSignals(True);combo.clear()
+        current=self.project_root or self.path
+        if current is not None:
+            combo.addItem(icon('folder' if self.project_root else 'file'),current.name,('current',current))
+            combo.setItemData(0,str(current),Qt.ToolTipRole)
+        else:
+            combo.addItem(icon('file'),'Untitled.scad',('current',None))
+        for kind,path in self.recent_entries():
+            if current is not None and Path(path).resolve()==Path(current).resolve():continue
+            combo.addItem(icon('folder' if kind=='project' else 'file'),f'{path.name}  ·  {path.parent.name}',(kind,path))
+            combo.setItemData(combo.count()-1,str(path),Qt.ToolTipRole)
+        combo.insertSeparator(combo.count())
+        combo.addItem(icon('open'),'Open project folder…',('open_folder',None))
+        combo.addItem(icon('open'),'Open file…',('open_file',None))
+        combo.setCurrentIndex(0);combo.blockSignals(False)
+
+    def project_switcher_chosen(self,index):
+        data=self.project_switcher.itemData(index)
+        self.project_switcher.setCurrentIndex(0)
+        if not data:return
+        kind,path=data
+        if kind=='open_folder':self.open_project()
+        elif kind=='open_file':self.open_file()
+        elif kind in ('project','file'):self.switch_project(path)
+
+    def switch_project(self,path):
+        """Jump to another project folder or file; unmodified tabs of the previous project are closed."""
+        path=Path(path)
+        if not path.exists():
+            self.info(f'{path} no longer exists');self.refresh_recent_menu();return
+        new_root=path if path.is_dir() else (path.parent if (path.parent/'scab-project.json').is_file() else None)
+        keep=lambda p:p is not None and new_root is not None and Path(p).resolve().is_relative_to(new_root.resolve())
+        for index in reversed(range(self.editor_tabs.count())):
+            editor=self.editor_tabs.widget(index);existing=self.buffers.get(editor)
+            if editor.document().isModified() or keep(existing) or (path.is_file() and existing==path.resolve()):continue
+            if self.editor_tabs.count()>1:self.close_document(index)
+        if new_root is None and self.project_root is not None and not path.resolve().is_relative_to(self.project_root):
+            self.project_root=None;self.project_entry=None;self.view_target.setCurrentIndex(0)
+        self.load_file(path)
+        self.refresh_project();self.refresh_project_switcher()
+
+    def forget_recent(self,path):
+        for key in ('recent','recent_projects'):
+            self.settings.setValue(key,[p for p in self.settings_list(key) if Path(p)!=Path(path)])
+        self.refresh_recent_menu();self.refresh_project()
+
+    def apply_project_filter(self,*_):
+        text=self.project_filter.text().strip().lower() if hasattr(self,'project_filter') else ''
+        def visit(item):
+            own=not text or text in item.text(0).lower() or text in item.text(1).lower()
+            child_match=False
+            for k in range(item.childCount()):
+                child_match=visit(item.child(k)) or child_match
+            show=own or child_match
+            item.setHidden(not show)
+            if text and child_match:item.setExpanded(True)
+            return show
+        for k in range(self.project_tree.topLevelItemCount()):
+            top=self.project_tree.topLevelItem(k)
+            if top.data(0,Qt.UserRole) and top.data(0,Qt.UserRole)[0]=='recent_group' and not text:
+                top.setHidden(False);visit(top);continue
+            visit(top)
 
     def wire_editor(self,editor):
         editor.hintChanged.connect(lambda text:self.hint.setText(text or 'Ctrl+Space: completion · F5: compile · Esc: normal mode · :help'))
@@ -204,7 +295,7 @@ class ProjectMixin:
                 if not files:raise ValueError('No .scad entry file in project')
                 entry=files[0]
             self.project_root=root;self.project_entry=entry
-            self.open_document(entry);self.view_target.setCurrentIndex(1);self.refresh_project()
+            self.open_document(entry);self.view_target.setCurrentIndex(1);self.remember_project(root);self.refresh_project()
         except (OSError,ValueError,KeyError) as error:self.error(str(error))
 
     def new_module_file(self):
@@ -287,7 +378,22 @@ class ProjectMixin:
                 item.setToolTip(0,str(entry.path));item.setToolTip(1,entry.error or str(entry.path))
                 if not entry.visible:item.setForeground(0,QBrush(QColor('#7d8188')))
                 group.addChild(item)
+        current=self.project_root or self.path
+        recent=[(k,p) for k,p in (self.recent_entries() if hasattr(self,'recent_entries') else [])
+                if current is None or Path(p).resolve()!=Path(current).resolve()]
+        if recent:
+            group=QTreeWidgetItem(['Recent',str(len(recent))]);group.setData(0,Qt.UserRole,('recent_group',None))
+            group.setToolTip(0,'Double-click a project or file to switch to it')
+            self.project_tree.addTopLevelItem(group)
+            for kind,path in recent[:15]:
+                item=QTreeWidgetItem([path.name,path.parent.name]);item.setIcon(0,icon('folder' if kind=='project' else 'file'))
+                item.setData(0,Qt.UserRole,('recent',None,path));item.setToolTip(0,str(path));group.addChild(item)
         self.project_tree.expandToDepth(1)
+        for k in range(self.project_tree.topLevelItemCount()):
+            top=self.project_tree.topLevelItem(k)
+            if top.data(0,Qt.UserRole) and top.data(0,Qt.UserRole)[0]=='recent_group':top.setExpanded(False)
+        self.apply_project_filter()
+        self.refresh_project_switcher()
 
     def project_item_open(self,item,column=0):
         data=item.data(0,Qt.UserRole)
@@ -296,6 +402,8 @@ class ProjectMixin:
         if path is not None:self.open_document(path)
         if kind=='module':self.editor.select_source(args[0],args[0]+len('module'));self.editor.setFocus()
         elif kind=='variable':self.edit_tree_variable(args[0])
+        elif kind=='recent':
+            self.switch_project(args[0]);return
         elif kind=='board':
             ident=args[0]
             self.select_board(ident);self.boards_panel.select(ident);self.focus_board(ident)
@@ -306,7 +414,15 @@ class ProjectMixin:
         data=item.data(0,Qt.UserRole) if item else None
         menu=QMenu(self)
         kind=data[0] if data else None
-        if kind=='board':
+        if kind=='recent':
+            path=data[2]
+            menu.addAction(icon('open'),'Switch to this '+('project' if Path(path).is_dir() else 'file'),lambda:self.switch_project(path))
+            menu.addAction('Show in file manager',lambda:QDesktopServices.openUrl(QUrl.fromLocalFile(str(path if Path(path).is_dir() else Path(path).parent))))
+            menu.addAction('Copy path',lambda:QApplication.clipboard().setText(str(path)))
+            menu.addAction('Remove from recent',lambda:self.forget_recent(path))
+        elif kind=='recent_group':
+            menu.addAction('Clear recent',self.clear_recent)
+        elif kind=='board':
             if not self.fill_board_menu(menu,data[2]):return
         elif kind=='file':
             path=data[1]
