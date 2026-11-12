@@ -291,6 +291,55 @@ class Editor(QPlainTextEdit):
         self.update_words()
         self.apply_cursor_shape()
 
+    # ------------------------------------------------------------ drag & drop
+    STATEMENT_MIME = 'application/x-scab-statement'   # a whole statement: dropped on its own line
+    INCLUDE_MIME = 'application/x-scab-include'       # include/use line: goes with the other includes at the top
+
+    def insertFromMimeData(self, source):
+        if source.hasFormat(self.INCLUDE_MIME):
+            line = bytes(source.data(self.INCLUDE_MIME)).decode('utf-8').strip()
+            text = self.toPlainText()
+            if line in text:
+                self.message.emit(f'Already in this file: {line}')
+                return
+            last = None
+            for m in re.finditer(r'^[ \t]*(?:include|use)\s*<[^>]*>[^\n]*\n|^[ \t]*//\s*scab\s*:[^\n]*\n|^[ \t]*\w+_pose\s*=[^\n]*\n', text, re.M):
+                last = m
+            at = last.end() if last else 0
+            cursor = QTextCursor(self.document())
+            cursor.setPosition(self.buffer.to_qt(at))
+            cursor.insertText(line + '\n')
+            self.after_drop(cursor)
+            self.message.emit(f'Added {line} with the other includes at the top')
+            return
+        if source.hasFormat(self.STATEMENT_MIME):
+            snippet = bytes(source.data(self.STATEMENT_MIME)).decode('utf-8')
+            cursor = self.textCursor()
+            block = cursor.block()
+            line = block.text()
+            indent = line[:len(line) - len(line.lstrip())]
+            body = '\n'.join(indent + l if l else l for l in snippet.rstrip('\n').split('\n')) + '\n'
+            if line.strip() and cursor.positionInBlock() > len(indent):
+                cursor.movePosition(QTextCursor.EndOfBlock)       # dropped inside a line: below it
+                body = '\n' + body.rstrip('\n')
+            else:
+                cursor.movePosition(QTextCursor.StartOfBlock)
+            cursor.insertText(body)
+            self.after_drop(cursor)
+            return
+        super().insertFromMimeData(source)
+        self.after_drop(self.textCursor())
+
+    def after_drop(self, cursor):
+        self.setTextCursor(cursor)
+        if self.vim:
+            self.vim_engine.refresh()
+            self.vim_engine.pos = self.buffer.to_py(cursor.position())
+            if self.vim_engine.mode not in ('NORMAL', 'INSERT'):
+                self.vim_engine.mode = 'NORMAL'
+            self.modeChanged.emit(self.mode)
+        self.setFocus()
+
     # ----------------------------------------------------------- properties
     @property
     def mode(self):

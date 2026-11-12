@@ -200,6 +200,7 @@ class Window(ProjectMixin,MoveMixin,QMainWindow):
         self.clearance_panel.partSelected.connect(self.select_board_part)
         self.boards = {}
         self.board_jobs = {}
+        self.board_model_cache = {}
         self.selected_board = None
         self.boards_panel = BoardsPanel()
         self.boards_panel.addRequested.connect(self.load_kicad)
@@ -1012,6 +1013,7 @@ class Window(ProjectMixin,MoveMixin,QMainWindow):
             self.error(f'KiCad board {ident}: {error}');return
         first=not any(b.model for b in self.boards.values())
         entry.model=model
+        if not partial:self.board_model_cache[str(entry.path)]=model    # for the project tree in other files
         for file in getattr(model,'files',()):
             if Path(file).exists() and str(file) not in self.board_watcher.files():self.board_watcher.addPath(str(file))
         self.update_board_view()

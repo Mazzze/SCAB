@@ -676,7 +676,7 @@ class Viewer(gl.GLViewWidget):
             return
         diff=e.position()-self.mousePos; self.mousePos=e.position()
         total=e.position()-self.press_pos
-        if total.manhattanLength()>3: self.moved=True
+        if total.manhattanLength()>(6 if e.modifiers()&Qt.ControlModifier else 3): self.moved=True
         if self.drag_kind:
             delta=np.array([total.x(),total.y()])
             precision=.1 if e.modifiers() & Qt.ShiftModifier else 1.
@@ -697,7 +697,10 @@ class Viewer(gl.GLViewWidget):
             else: self.planeMoved.emit(self.drag_value)
             return
         if e.buttons() & Qt.LeftButton:
-            if e.modifiers() & Qt.ControlModifier:self.set_roll(self.roll+diff.x()*.5)
+            # a click (Ctrl+click adds to the selection) must survive a little hand jitter
+            if not self.moved:return
+            if e.modifiers() & Qt.ControlModifier:
+                if total.manhattanLength()>8:self.set_roll(self.roll+diff.x()*.5)
             elif e.modifiers() & (Qt.ShiftModifier|Qt.AltModifier|Qt.ControlModifier): self.pan(diff.x(),diff.y(),0,relative='view')
             else: self.orbit(-diff.x()*.5,diff.y()*.5)
         elif e.buttons() & Qt.MiddleButton:

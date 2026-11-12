@@ -1,0 +1,3 @@
+#!/usr/bin/env sh
+# SCAB command line (JSON output) — see AGENTS.md.  Example: tools/scab-cli check design.scad
+exec python3 "$(dirname "$0")/scab_launch.py" cli "$@"
