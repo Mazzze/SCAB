@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "scab": {
+      "command": "python3",
+      "args": ["tools/scab_launch.py", "mcp"],
+      "env": {}
+    }
+  }
+}

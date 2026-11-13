@@ -4,16 +4,30 @@ import re
 from pathlib import Path
 from PySide6.QtCore import Qt,QTimer,QObject,QEvent,QUrl
 from PySide6.QtGui import QAction,QTextCursor,QColor,QBrush,QDesktopServices
-from PySide6.QtWidgets import (QApplication,QMenu,QToolButton,QWidget,QTreeWidget,QTreeWidgetItem,QTabWidget,QFileDialog,QInputDialog,
+from PySide6.QtWidgets import (QAbstractItemView,QApplication,QMenu,QToolButton,QWidget,QTreeWidget,QTreeWidgetItem,QTabWidget,QFileDialog,QInputDialog,
     QMessageBox,QComboBox,QDialog,QVBoxLayout,QHBoxLayout,QLineEdit,QLabel,QDialogButtonBox,QPushButton)
 from .editor import Editor
 from .model import Document,SourceError
 from .icons import icon
 
+class ProjectTree(QTreeWidget):
+    """Project tree whose rows can be dragged into the editor as code."""
+    def __init__(self,owner):
+        super().__init__()
+        self.owner=owner
+        self.setDragEnabled(True);self.setDragDropMode(QAbstractItemView.DragOnly)
+
+    def mimeTypes(self):
+        return ['text/plain']
+
+    def mimeData(self,items):
+        return self.owner.project_item_mime(items[0] if items else None)
+
+
 class ProjectMixin:
     def setup_documents(self,left_layout,middle_layout):
         self.project_root=None;self.project_entry=None;self.buffers={self.editor:None};self.switching=False
-        self.project_tree=QTreeWidget();self.project_tree.setHeaderLabels(['Project','Value'])
+        self.project_tree=ProjectTree(self);self.project_tree.setHeaderLabels(['Project','Value'])
         self.project_tree.setColumnWidth(0,145);self.project_tree.setColumnWidth(1,90)
         self.project_tree.setMinimumHeight(60)
         self.project_tree.itemDoubleClicked.connect(self.project_item_open)
@@ -39,7 +53,8 @@ class ProjectMixin:
         menu=QMenu('Project',self);self.project_menu_bar.insertMenu(self.help_menu.menuAction(),menu)
         for title,fn,shortcut in [('New project…',self.new_project,''),('Open project…',self.open_project,''),
             ('New module file…',self.new_module_file,''),('Save all',self.save_all,'Ctrl+Alt+S'),
-            ('Build entry (saves all)',self.build_project,'Ctrl+B'),('Go to module definition',self.goto_definition,'F12')]:
+            ('Build entry (saves all)',self.build_project,'Ctrl+B'),('Go to module definition',self.goto_definition,'F12'),
+            ('Set up this folder for AI agents…',self.setup_agents,'')]:
             action=QAction(title,self);action.triggered.connect(fn)
             if shortcut:action.setShortcut(shortcut)
             menu.addAction(action)
@@ -114,6 +129,18 @@ class ProjectMixin:
             self.project_root=None;self.project_entry=None;self.view_target.setCurrentIndex(0)
         self.load_file(path)
         self.refresh_project();self.refresh_project_switcher()
+
+    def setup_agents(self):
+        """AGENTS.md (how to design with SCAB) and .mcp.json (SCAB's tools) in the project folder."""
+        folder=self.project_root or (self.path.parent if self.path else None)
+        if folder is None:
+            self.info('Save the file first: the agent files go next to it');return
+        from .cli import init_project
+        result=init_project(folder)
+        written=[Path(p).name for p in result['written']];kept=[Path(p).name for p in result['kept (use --force)']]
+        self.info(f'AI agent setup in {folder.name}: '+(f'wrote {", ".join(written)}' if written else 'nothing new')+
+                  (f' · kept existing {", ".join(kept)}' if kept else '')+' · an agent started there can now use the scab tools')
+        self.refresh_project()
 
     def forget_recent(self,path):
         for key in ('recent','recent_projects'):
@@ -368,16 +395,22 @@ class ProjectMixin:
                     if file==path:
                         item=QTreeWidgetItem(['module '+name,'↗']);item.setData(0,Qt.UserRole,('module',path,a,b));fileitem.addChild(item)
             except (OSError,SourceError):continue
-        boards=getattr(self,'boards',{})
+        boards=self.project_boards()
         if boards:
             group=QTreeWidgetItem(['KiCad boards',str(len(boards))]);group.setData(0,Qt.UserRole,('boards',None))
+            group.setToolTip(0,'Drag a board, or one of its lines, into the code')
             self.project_tree.addTopLevelItem(group)
-            for ident,entry in boards.items():
-                state='loading…' if entry.loading else 'error' if entry.error else '' if entry.visible else 'hidden'
-                item=QTreeWidgetItem([ident,state or entry.path.name]);item.setData(0,Qt.UserRole,('board',None,ident))
-                item.setToolTip(0,str(entry.path));item.setToolTip(1,entry.error or str(entry.path))
-                if not entry.visible:item.setForeground(0,QBrush(QColor('#7d8188')))
+            for info in boards:
+                ident,entry=info['ident'],info['entry']
+                if entry is not None:
+                    state='loading…' if entry.loading else 'error' if entry.error else '' if entry.visible else 'hidden'
+                else:state=f'in {info["owner"].name}'
+                item=QTreeWidgetItem([ident,state or info['path'].name]);item.setData(0,Qt.UserRole,('board',None,ident))
+                item.setToolTip(0,f'{info["path"]}\nDrag into the code: the include line, or {ident}_place() {ident}_pcb(); once it is included')
+                item.setToolTip(1,(entry.error if entry is not None else '') or str(info['path']))
+                if entry is not None and not entry.visible:item.setForeground(0,QBrush(QColor('#7d8188')))
                 group.addChild(item)
+                self.add_board_snippets(item,info)
         current=self.project_root or self.path
         recent=[(k,p) for k,p in (self.recent_entries() if hasattr(self,'recent_entries') else [])
                 if current is None or Path(p).resolve()!=Path(current).resolve()]
@@ -395,9 +428,100 @@ class ProjectMixin:
         self.apply_project_filter()
         self.refresh_project_switcher()
 
+    # ------------------------------------------------------- boards & snippets
+    def project_boards(self):
+        """Boards of the current file, plus boards linked from other files of the project (with the file that links them)."""
+        from .kicad_import import find_kicad_links,include_names
+        out,seen=[],set()
+        for ident,entry in getattr(self,'boards',{}).items():
+            out.append({'ident':ident,'path':entry.path,'owner':self.path,'entry':entry});seen.add(ident)
+        files=[f for f in self.project_files() if f is not None and f!=self.path] if self.project_root else []
+        for file in files:
+            try:source=self.source_for(file)
+            except (OSError,UnicodeError):continue
+            if 'scab' not in source:continue
+            for ident,path in find_kicad_links(source,file):
+                if ident in seen:continue
+                seen.add(ident);out.append({'ident':ident,'path':path,'owner':file,'entry':None})
+        for info in out:
+            owner_dir=(Path(info['owner']).parent if info['owner'] else Path.cwd())
+            info['include']=owner_dir/'kicad'/include_names(info['ident'],Path(info['path']).stem)[0]
+        return out
+
+    def include_text(self,target):
+        """`include <...>` for a file, relative to the file being edited."""
+        import os
+        base=self.path.parent if self.path else Path.cwd()
+        try:rel=os.path.relpath(Path(target),base).replace(os.sep,'/')
+        except ValueError:rel=str(target)
+        return rel
+
+    def add_board_snippets(self,item,info):
+        """Child rows of a board: lines of code to drag (or double-click) into the editor."""
+        ident=info['ident'];P=ident+'_'
+        include=f'include <{self.include_text(info["include"])}>'
+        rows=[(include,'include','The include with the board\'s outline, holes, parts, …'),
+              (f'{P}place() {{ … }}','statement:'+f'{P}place() {{\n    \n}}','Children in board coordinates, placed where the board sits'),
+              (f'{P}place() {P}pcb();','statement:'+f'{P}place() {P}pcb();','The board with its parts, at its place in the design'),
+              (f'standoffs at {P}mounting_holes','statement:'+f'{P}place() for (h = {P}mounting_holes)\n    translate([h[0][0], h[0][1], -5]) difference() {{\n        cylinder(d = h[1] + 3, h = 5);\n        cylinder(d = h[1] * 0.85, h = 5.1);\n    }}','A standoff under every mounting hole (edit height / diameters)'),
+              (f'{P}board_size','expression',f'[width, depth] of {ident}'),
+              (f'{P}board_thickness','expression','Board thickness'),
+              (f'{P}board_outline','expression','Outline polygon (board coordinates)'),
+              (f'{P}parts_top','expression','Height of the tallest part above the board')]
+        code=QTreeWidgetItem(['code',str(len(rows))]);code.setData(0,Qt.UserRole,('snippets',None))
+        item.addChild(code)
+        for label,kind,tip in rows:
+            text=label if kind in ('include','expression') else kind.split(':',1)[1]
+            child=QTreeWidgetItem([label,'']);child.setData(0,Qt.UserRole,('snippet',kind.split(':')[0],text))
+            child.setToolTip(0,tip+' · drag into the code or double-click');code.addChild(child)
+        entry=info['entry']
+        model=entry.model if entry is not None and entry.model is not None else getattr(self,'board_model_cache',{}).get(str(info['path']))
+        if model is not None and model.parts:
+            parts=QTreeWidgetItem(['parts',str(len(model.parts))]);parts.setData(0,Qt.UserRole,('snippets',None))
+            item.addChild(parts)
+            for part in model.parts:
+                fp=part.footprint
+                child=QTreeWidgetItem([part.ref,fp.value])
+                child.setData(0,Qt.UserRole,('snippet','statement',f'{P}place() {P}part_box("{part.ref}", margin = 0.5);'))
+                child.setToolTip(0,f'{fp.lib} · {fp.side} · drag: a box around {part.ref} (for a cutout: put it in a difference())')
+                parts.addChild(child)
+
+    def project_item_mime(self,item):
+        """What dragging a project tree row into the editor inserts."""
+        from PySide6.QtCore import QMimeData
+        from .editor import Editor as _E
+        mime=QMimeData()
+        data=item.data(0,Qt.UserRole) if item else None
+        if not data:return mime
+        kind=data[0]
+        def statement(text):
+            mime.setText(text);mime.setData(_E.STATEMENT_MIME,text.encode('utf-8'))
+        def include(text):
+            mime.setText(text);mime.setData(_E.INCLUDE_MIME,text.encode('utf-8'))
+        if kind=='snippet':
+            _,how,text=data
+            if how=='include':include(text)
+            elif how=='statement':statement(text)
+            else:mime.setText(text)
+        elif kind=='variable':mime.setText(data[2])
+        elif kind=='module':statement(item.text(0).split(' ',1)[-1]+'();')
+        elif kind=='file' and data[1] is not None and data[1]!=self.path:
+            try:only_modules=all(n.kind=='definition' for n in Document(self.source_for(data[1])).nodes)
+            except (OSError,SourceError):only_modules=False
+            include(f'{"use" if only_modules else "include"} <{self.include_text(data[1])}>')
+        elif kind=='board':
+            info=next((b for b in self.project_boards() if b['ident']==data[2]),None)
+            if info is not None:
+                line=f'include <{self.include_text(info["include"])}>'
+                if Path(info['include']).name in self.editor.toPlainText():statement(f'{data[2]}_place() {data[2]}_pcb();')
+                else:include(line)
+        return mime
+
     def project_item_open(self,item,column=0):
         data=item.data(0,Qt.UserRole)
         if not data:return
+        if data[0]=='snippet':
+            self.editor.insertFromMimeData(self.project_item_mime(item));return
         kind,path,*args=data
         if path is not None:self.open_document(path)
         if kind=='module':self.editor.select_source(args[0],args[0]+len('module'));self.editor.setFocus()
@@ -406,7 +530,8 @@ class ProjectMixin:
             self.switch_project(args[0]);return
         elif kind=='board':
             ident=args[0]
-            self.select_board(ident);self.boards_panel.select(ident);self.focus_board(ident)
+            if ident in getattr(self,'boards',{}):
+                self.select_board(ident);self.boards_panel.select(ident);self.focus_board(ident)
 
     def project_context_menu(self,pos):
         item=self.project_tree.itemAt(pos)

@@ -107,7 +107,7 @@ class MoveMixin:
         self.move_source = None
         self.move_picks = []
         self.move_chooser = ChooserBar(self.viewer, self)
-        self.viewer.pickedAdd.connect(lambda start, point: self.pick_move_target(start, point, additive=True))
+        self.viewer.pickedAdd.connect(self.ctrl_pick)
 
     # ------------------------------------------------------------- helpers
     def move_mode(self):
@@ -262,6 +262,29 @@ class MoveMixin:
             self.move_choice = index
         self.move_source = self.doc.source
         self.show_move_targets()
+
+    def ctrl_pick(self, start, point):
+        """Ctrl+click in the 3D view: add to the selection. From Inspect / Dimensions it switches to Move,
+        keeping the object that was clicked before as the first one."""
+        if self.move_mode():
+            self.pick_move_target(start, point, additive=True)
+            return
+        if not self.view_matches_editor():
+            self.info('Compile the current source before selecting parts')
+            return
+        first = getattr(self, 'last_pick', None)
+        first = first if first and first[0] >= 0 and first[1] is not None else None
+        self.object_tool.setCurrentText('Move')
+        self.info('Move · Ctrl+click adds objects · drag the arrows to move them together (they become a group) · Ctrl+G names the group')
+
+        def run():
+            if first is not None and not self.move_targets:
+                self.pick_move_target(first[0], first[1], level=('whole',))
+            self.pick_move_target(start, point, additive=bool(self.move_targets), level=('whole',))
+        if self.trace_result is None or self.trace_key is None or self.trace_key[0] != self.compiled_source:
+            self.request_trace(run)
+        else:
+            run()
 
     def choose_move_option(self, index):
         if not self.move_options or not 0 <= index < len(self.move_options):

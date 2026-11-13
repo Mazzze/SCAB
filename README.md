@@ -30,6 +30,28 @@ Measured on a PCB-like test model (board with 200 drilled holes + 600 placed
 components, CGAL backend): first compile **242 s → 7.5 s**, recompile after
 changing one component **235 s → 0.16 s**.
 
+## AI agents
+
+SCAB comes with a guide and tools so an AI agent (Claude Code, or any MCP
+client) can design enclosures around your KiCad boards:
+
+* [`AGENTS.md`](AGENTS.md) — how designs are linked to boards, the board API,
+  coordinates, design rules, recipes and a worked example
+  ([`examples/agent_enclosure/enclosure.scad`](examples/agent_enclosure/enclosure.scad),
+  made only from board data; it passes the check).
+* **MCP server** (`.mcp.json` here; `python3 tools/scab_launch.py mcp`):
+  `scab_info`, `scab_board`, `scab_link_board`, `scab_set_pose`,
+  `scab_update_includes`, `scab_check` (OpenSCAD errors + clearance of every
+  part), `scab_render` (returns a picture), `scab_export` (STL / STEP).
+* **Command line** with JSON output: `tools/scab-cli info|board|link|pose|update|check|clearance|render|export|init`.
+  `check` exits non-zero when the design has errors or a part collides.
+* For a design in another folder: `tools/scab-cli init <folder>` or, in the
+  app, `Project → Set up this folder for AI agents…` — writes `AGENTS.md`,
+  `.mcp.json` (pointing to SCAB) and `CLAUDE.md` there. Start the agent in
+  that folder; SCAB reloads the files it changes.
+
+![An enclosure written by following AGENTS.md, rendered with scab-cli render](docs/agent_enclosure.png)
+
 ## Getting started
 
 Requirements: [OpenSCAD](https://openscad.org) (2021.01 or newer; a 2023+ build
@@ -71,7 +93,8 @@ Try `examples/parametric_mount.scad` (opened at start-up) and
   (Tab cycles). Moving a part edits its own literal `translate([...])` or adds
   one; drags along world axes stay world axes inside rotated groups.
 * **Grouping**: Ctrl+click more parts (Ctrl+click again removes one), or
-  Ctrl+click rows in the object list. Dragging several parts groups them:
+  Ctrl+click rows in the object list. Ctrl+click also works from Inspect: it
+  switches to Move and keeps the object you clicked before as the first one. Dragging several parts groups them:
   neighbours in the text get one `translate(<name>) { … }`, parts spread over
   the file each get `translate(<name>)` with the same variable — so they move
   together from then on. The name is made from what you grouped: the comment
@@ -103,6 +126,16 @@ Try `examples/parametric_mount.scad` (opened at start-up) and
   The filter finds files, variables, modules and boards. The tree lists the
   project's files with their variables and modules, the KiCad boards and a
   **Recent** section (double-click to switch, right-click to remove).
+* **Drag code from the project panel** into the editor: a KiCad board drags
+  in as its `include <…/kicad/<board>.scad>` line (with the right relative
+  path — also into module files of the project that do not link the board
+  themselves), and once included as `<id>_place() <id>_pcb();`. Under each
+  board, *code* holds ready lines (`<id>_place() { … }`, standoffs at the
+  mounting holes, `<id>_board_size`, …) and *parts* a cutout box per part.
+  Variables drag in as their name, modules as a call, files as an
+  `include` / `use` line. Includes always land with the other includes at the
+  top; statements go on their own line. Double-click a code row to insert it
+  at the cursor.
 * `File → Save view as PNG`; files changed by another program are reloaded
   automatically when they have no unsaved edits.
 
@@ -373,6 +406,7 @@ Layout:
 | `scab/diagnostics.py`, `problems.py` | Error parsing / mapping and the Problems panel |
 | `scab/kicad.py` | `.kicad_pcb` / CSV export |
 | `scab/kicad_import.py`, `vrml.py`, `step.py` | KiCad board, silkscreen and 3D model (VRML / STEP) import, generated SCAD include |
+| `scab/headless.py`, `cli.py`, `mcp_server.py` | Tools for scripts and AI agents (no window): info, link, pose, check, clearance, render, export |
 | `scab/grouping.py`, `move_tool.py` | Moving parts inside groups, grouping with a shared position variable |
 | `scab/kicad_copper.py` | Copper layers, stackup heights and board colors |
 | `scab/kicad_silk.py`, `meshgen.py` | Exact silkscreen via `kicad-cli` SVG, direct NumPy meshes for pads and silkscreen |
